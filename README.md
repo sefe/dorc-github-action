@@ -22,7 +22,7 @@ This is the GitHub Actions equivalent of the [DOrc Azure DevOps Extension](https
 
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `base-url` | Yes | | DOrc API base URL (e.g. `https://deploymentportal:8443/`) |
+| `base-url` | Yes | | DOrc API base URL (e.g. `https://dorc:8443/`) |
 | `dorc-ids-secret` | Yes | | Identity Server client secret for DOrc API |
 | `project` | Yes | | Project name as configured in DOrc |
 | `environment` | Yes | | Target environment name as configured in DOrc |
