@@ -1,0 +1,54 @@
+name: 'DOrc Deploy Request'
+description: 'Trigger a DOrc deployment request from a GitHub Actions workflow'
+author: 'SEFE'
+
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  base-url:
+    description: 'DOrc API base URL (e.g. https://deploymentportal:8443/)'
+    required: true
+  dorc-ids-secret:
+    description: 'Identity Server client secret for DOrc API'
+    required: true
+  project:
+    description: 'Project name as configured in DOrc'
+    required: true
+  environment:
+    description: 'Target environment name as configured in DOrc'
+    required: true
+  components:
+    description: 'Semicolon-delimited list of DOrc components to deploy'
+    required: true
+  build-text:
+    description: 'Name of the build'
+    required: false
+    default: ''
+  build-num:
+    description: 'Version of the build, or "latest"'
+    required: false
+    default: ''
+  pinned:
+    description: 'Use only pinned builds'
+    required: false
+    default: 'false'
+  build-uri:
+    description: 'Drop folder URI or artifact location (for non-TFS builds)'
+    required: false
+    default: ''
+  poll-interval:
+    description: 'Seconds between status polls'
+    required: false
+    default: '5'
+
+outputs:
+  request-id:
+    description: 'The DOrc request ID that was created'
+  status:
+    description: 'Final status of the deployment request'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
