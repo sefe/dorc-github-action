@@ -30,8 +30,9 @@ This is the GitHub Actions equivalent of the [DOrc Azure DevOps Extension](https
 | `build-text` | No | `''` | Name of the build |
 | `build-num` | No | `''` | Version of the build, or `"latest"` |
 | `pinned` | No | `false` | Use only pinned builds |
-| `build-uri` | No | `''` | Drop folder URI or artifact location |
-| `poll-interval` | No | `5` | Seconds between status polls |
+| `build-uri` | No | `''` | Artifact location URI (e.g. drop folder or GitHub artifact URL) |
+| `poll-interval` | No | `5` | Seconds between status polls (minimum 1) |
+| `timeout` | No | `60` | Maximum minutes to wait for deployment to complete |
 
 ## Outputs
 
@@ -71,6 +72,7 @@ jobs:
           environment: ${{ inputs.environment }}
           components: 'WebApp;Database;API'
           build-num: 'latest'
+          timeout: '120'
 
       - name: Report result
         if: always()
@@ -81,7 +83,7 @@ jobs:
 
 ## Using with GitHub Artifacts
 
-To deploy from GitHub artifact locations rather than TFS/Azure DevOps builds, use the `build-uri` input:
+To deploy from a GitHub artifact location, use the `build-uri` input:
 
 ```yaml
 - name: Deploy via DOrc
@@ -92,8 +94,17 @@ To deploy from GitHub artifact locations rather than TFS/Azure DevOps builds, us
     project: 'MyProject'
     environment: 'DEV'
     components: 'WebApp'
-    build-uri: 'https://github.com/sefe/my-repo/actions/runs/12345/artifacts'
+    build-uri: ${{ steps.upload.outputs.artifact-url }}
 ```
+
+## Error Handling
+
+The action includes:
+
+- **Automatic token refresh** — OAuth tokens are refreshed proactively before expiry and on 401 responses.
+- **Transient error retry** — HTTP 502/503/504 and network errors are retried up to 3 times with exponential backoff.
+- **Deployment timeout** — Configurable via the `timeout` input (default: 60 minutes). Prevents runaway jobs.
+- **Request timeouts** — Individual HTTP requests time out after 30-60 seconds to prevent hanging on unresponsive servers.
 
 ## Development
 
@@ -115,6 +126,8 @@ After making changes, always run `npm run bundle` and commit the `dist/` folder.
 
 ## Releasing
 
-1. Create a tag: `git tag -a v1.0.0 -m "Release v1.0.0"`
-2. Push the tag: `git push origin v1.0.0`
-3. Update the major version tag: `git tag -fa v1 -m "Update v1 tag" && git push origin v1 --force`
+1. Run all checks: `npm run all`
+2. Commit the updated `dist/` folder
+3. Create a tag: `git tag -a v1.x.x -m "Release v1.x.x"`
+4. Push the tag: `git push origin v1.x.x`
+5. Update the major version tag: `git tag -fa v1 -m "Update v1 tag" && git push origin v1 --force`

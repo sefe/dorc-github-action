@@ -9,6 +9,7 @@ export interface TokenConfig {
 }
 
 const REFRESH_WINDOW_SECONDS = 120
+const FETCH_TIMEOUT_MS = 30_000
 
 export async function fetchAccessToken(
   config: TokenConfig
@@ -23,7 +24,8 @@ export async function fetchAccessToken(
   const response = await fetch(config.tokenUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString()
+    body: body.toString(),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
   })
 
   if (!response.ok) {
@@ -32,12 +34,24 @@ export async function fetchAccessToken(
     )
   }
 
-  const data = (await response.json()) as { access_token: string; expires_in?: number }
-  const expiresIn = data.expires_in ?? 3600
+  const data: unknown = await response.json()
+  if (
+    typeof data !== 'object' ||
+    data === null ||
+    !('access_token' in data) ||
+    typeof (data as Record<string, unknown>).access_token !== 'string'
+  ) {
+    throw new Error(
+      'Invalid token response: missing or invalid access_token field'
+    )
+  }
+
+  const tokenData = data as { access_token: string; expires_in?: number }
+  const expiresIn = tokenData.expires_in ?? 3600
   const safeExpiry = Math.max(expiresIn - REFRESH_WINDOW_SECONDS, 30)
 
   return {
-    accessToken: data.access_token,
+    accessToken: tokenData.access_token,
     expiresAt: new Date(Date.now() + safeExpiry * 1000)
   }
 }
@@ -47,12 +61,26 @@ export function isTokenExpired(state: TokenState): boolean {
 }
 
 export async function resolveTokenUrl(baseUrl: string): Promise<string> {
-  const response = await fetch(`${baseUrl}/ApiConfig`)
+  const url = `${baseUrl.replace(/\/+$/, '')}/ApiConfig`
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+  })
   if (!response.ok) {
     throw new Error(
       `Failed to get API config: ${response.status} ${response.statusText}`
     )
   }
-  const config = (await response.json()) as { OAuthAuthority: string }
-  return `${config.OAuthAuthority}/connect/token`
+  const config: unknown = await response.json()
+  if (
+    typeof config !== 'object' ||
+    config === null ||
+    !('OAuthAuthority' in config) ||
+    typeof (config as Record<string, unknown>).OAuthAuthority !== 'string' ||
+    !(config as Record<string, unknown>).OAuthAuthority
+  ) {
+    throw new Error(
+      'DOrc API config response missing or empty OAuthAuthority field'
+    )
+  }
+  return `${(config as { OAuthAuthority: string }).OAuthAuthority}/connect/token`
 }

@@ -4,8 +4,12 @@ import { DorcClient, DeployRequest } from './dorc-client'
 
 export async function run(): Promise<void> {
   try {
-    const baseUrl = core.getInput('base-url', { required: true }).replace(/\/+$/, '')
+    const baseUrl = core
+      .getInput('base-url', { required: true })
+      .replace(/\/+$/, '')
     const clientSecret = core.getInput('dorc-ids-secret', { required: true })
+    core.setSecret(clientSecret)
+
     const project = core.getInput('project', { required: true })
     const environment = core.getInput('environment', { required: true })
     const components = core.getInput('components', { required: true })
@@ -13,10 +17,29 @@ export async function run(): Promise<void> {
     const buildNum = core.getInput('build-num')
     const pinned = core.getBooleanInput('pinned')
     const buildUri = core.getInput('build-uri')
-    const pollInterval = parseInt(core.getInput('poll-interval') || '5', 10)
 
-    // Mask the secret from logs
-    core.setSecret(clientSecret)
+    const pollInterval = parseInt(core.getInput('poll-interval') || '5', 10)
+    if (isNaN(pollInterval) || pollInterval < 1) {
+      core.setFailed('poll-interval must be a positive integer (minimum 1)')
+      return
+    }
+
+    const timeout = parseInt(core.getInput('timeout') || '60', 10)
+    if (isNaN(timeout) || timeout < 1) {
+      core.setFailed('timeout must be a positive integer (minimum 1)')
+      return
+    }
+
+    const componentList = components
+      .split(';')
+      .map(c => c.trim())
+      .filter(c => c)
+    if (componentList.length === 0) {
+      core.setFailed(
+        'components must contain at least one non-empty component name'
+      )
+      return
+    }
 
     core.info(`DOrc API URL: ${baseUrl}`)
 
@@ -34,7 +57,7 @@ export async function run(): Promise<void> {
       BuildText: buildText,
       BuildNum: buildNum,
       Pinned: pinned,
-      Components: components.split(';').map(c => c.trim()).filter(c => c)
+      Components: componentList
     }
 
     // Create the deployment request
@@ -49,12 +72,23 @@ export async function run(): Promise<void> {
     core.setOutput('request-id', result.Id.toString())
 
     // Poll until completion
-    const finalStatus = await client.pollUntilComplete(result.Id, pollInterval)
+    const finalStatus = await client.pollUntilComplete(
+      result.Id,
+      pollInterval,
+      timeout
+    )
     core.setOutput('status', finalStatus)
 
-    // Log component results
-    core.info('Collecting deploy results...')
-    await client.logComponentResults(result.Id)
+    // Log component results — wrapped so a failure here doesn't mask the
+    // deployment status that has already been determined
+    try {
+      core.info('Collecting deploy results...')
+      await client.logComponentResults(result.Id)
+    } catch (logError) {
+      core.warning(
+        `Failed to fetch component results: ${logError instanceof Error ? logError.message : logError}`
+      )
+    }
 
     if (client.isSuccessStatus(finalStatus)) {
       core.info(`Deployment completed successfully: ${finalStatus}`)
@@ -69,4 +103,3 @@ export async function run(): Promise<void> {
     }
   }
 }
-

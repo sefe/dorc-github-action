@@ -1,9 +1,9 @@
 node_modules/
 lib/
+coverage/
 
 # Keep dist/ committed - GitHub Actions needs it
 # dist/
 
-*.js.map
 *.tsbuildinfo
 .eslintcache

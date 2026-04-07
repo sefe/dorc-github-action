@@ -35,13 +35,17 @@ inputs:
     required: false
     default: 'false'
   build-uri:
-    description: 'Drop folder URI or artifact location (for non-TFS builds)'
+    description: 'Artifact location URI (e.g. drop folder or GitHub artifact URL)'
     required: false
     default: ''
   poll-interval:
-    description: 'Seconds between status polls'
+    description: 'Seconds between status polls (minimum 1)'
     required: false
     default: '5'
+  timeout:
+    description: 'Maximum minutes to wait for deployment to complete'
+    required: false
+    default: '60'
 
 outputs:
   request-id:

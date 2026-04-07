@@ -30,6 +30,20 @@ export interface ComponentResult {
 const GOOD_STATUSES = ['Completed']
 const BAD_STATUSES = ['Errored', 'Cancelled', 'Failed']
 const TERMINAL_STATUSES = [...GOOD_STATUSES, ...BAD_STATUSES]
+const FETCH_TIMEOUT_MS = 60_000
+const RETRYABLE_STATUS_CODES = [502, 503, 504]
+const MAX_RETRIES = 3
+const RETRY_BASE_DELAY_MS = 1000
+
+function isRetryableError(error: unknown): boolean {
+  if (error instanceof Error && error.name === 'TimeoutError') return true
+  if (error instanceof TypeError) return true // network failures
+  return false
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 export class DorcClient {
   private tokenState: TokenState | null = null
@@ -52,44 +66,101 @@ export class DorcClient {
     path: string,
     body?: object
   ): Promise<T> {
-    const token = await this.ensureToken()
     const url = `${this.baseUrl}${path}`
-    const options: RequestInit = {
-      method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const token = await this.ensureToken()
+      const options: RequestInit = {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
       }
-    }
-    if (body) {
-      options.body = JSON.stringify(body)
-    }
-
-    let response = await fetch(url, options)
-
-    // Retry once on 401 with a fresh token
-    if (response.status === 401) {
-      core.info('Received 401, refreshing token and retrying...')
-      this.tokenState = await fetchAccessToken(this.tokenConfig)
-      options.headers = {
-        Authorization: `Bearer ${this.tokenState.accessToken}`,
-        'Content-Type': 'application/json'
+      if (body) {
+        options.body = JSON.stringify(body)
       }
-      response = await fetch(url, options)
+
+      let response: Response
+      try {
+        response = await fetch(url, options)
+      } catch (error) {
+        if (attempt < MAX_RETRIES && isRetryableError(error)) {
+          const delay =
+            RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000
+          core.warning(
+            `Request to ${path} failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${error}. Retrying in ${Math.round(delay)}ms...`
+          )
+          await sleep(delay)
+          continue
+        }
+        throw error
+      }
+
+      // Retry once on 401 with a fresh token
+      if (response.status === 401) {
+        core.info('Received 401, refreshing token and retrying...')
+        this.tokenState = await fetchAccessToken(this.tokenConfig)
+        const retryOptions: RequestInit = {
+          method,
+          headers: {
+            Authorization: `Bearer ${this.tokenState.accessToken}`,
+            'Content-Type': 'application/json'
+          },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+        }
+        if (body) {
+          retryOptions.body = JSON.stringify(body)
+        }
+        response = await fetch(url, retryOptions)
+      }
+
+      // Retry on transient server errors
+      if (
+        RETRYABLE_STATUS_CODES.includes(response.status) &&
+        attempt < MAX_RETRIES
+      ) {
+        const delay =
+          RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000
+        core.warning(
+          `DOrc API returned ${response.status} for ${path} (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Retrying in ${Math.round(delay)}ms...`
+        )
+        await sleep(delay)
+        continue
+      }
+
+      if (!response.ok) {
+        let errorText = 'No error details'
+        try {
+          errorText = await response.text()
+          if (errorText.length > 500) {
+            errorText = errorText.substring(0, 500) + '...'
+          }
+        } catch {
+          errorText = 'Could not read response body'
+        }
+        throw new Error(
+          `DOrc API ${method} ${path} failed: ${response.status} ${response.statusText} - ${errorText}`
+        )
+      }
+
+      let json: unknown
+      try {
+        json = await response.json()
+      } catch {
+        throw new Error(
+          `DOrc API ${method} ${path} returned non-JSON response`
+        )
+      }
+      return json as T
     }
 
-    if (!response.ok) {
-      const text = await response.text()
-      throw new Error(
-        `DOrc API ${method} ${path} failed: ${response.status} ${response.statusText} - ${text}`
-      )
-    }
-
-    return (await response.json()) as T
+    throw new Error(`DOrc API ${method} ${path} failed after ${MAX_RETRIES + 1} attempts`)
   }
 
   async createRequest(req: DeployRequest): Promise<RequestStatus> {
-    core.info(`Creating DOrc request: ${JSON.stringify(req)}`)
+    core.debug(`Creating DOrc request: ${JSON.stringify(req)}`)
     return this.request<RequestStatus>('POST', '/Request', req)
   }
 
@@ -106,14 +177,14 @@ export class DorcClient {
 
   async pollUntilComplete(
     requestId: number,
-    pollIntervalSeconds: number
+    pollIntervalSeconds: number,
+    timeoutMinutes: number
   ): Promise<string> {
     let lastStatus = ''
+    const deadline = Date.now() + timeoutMinutes * 60 * 1000
 
-    while (true) {
-      await new Promise(resolve =>
-        setTimeout(resolve, pollIntervalSeconds * 1000)
-      )
+    while (Date.now() <= deadline) {
+      await sleep(pollIntervalSeconds * 1000)
 
       const status = await this.getRequestStatus(requestId)
 
@@ -126,6 +197,10 @@ export class DorcClient {
         return lastStatus
       }
     }
+
+    throw new Error(
+      `Deployment timed out after ${timeoutMinutes} minutes. Last status: ${lastStatus || 'unknown'}`
+    )
   }
 
   async logComponentResults(requestId: number): Promise<void> {

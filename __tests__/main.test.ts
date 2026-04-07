@@ -1,10 +1,8 @@
 import * as core from '@actions/core'
 import { run } from '../src/main'
 
-// Mock @actions/core
 jest.mock('@actions/core')
 
-// Mock fetch globally
 const mockFetch = jest.fn()
 global.fetch = mockFetch
 
@@ -27,7 +25,8 @@ describe('main', () => {
       'build-num': 'latest',
       pinned: 'false',
       'build-uri': '',
-      'poll-interval': '1'
+      'poll-interval': '1',
+      timeout: '60'
     }
     const inputs = { ...defaults, ...overrides }
 
@@ -40,12 +39,10 @@ describe('main', () => {
   }
 
   function mockTokenEndpoint(): void {
-    // ApiConfig call
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ OAuthAuthority: 'https://ids.example.com' })
     })
-    // Token call
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
@@ -59,19 +56,16 @@ describe('main', () => {
     setupInputs()
     mockTokenEndpoint()
 
-    // POST /Request
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ Id: 100, Status: 'Pending' })
     })
 
-    // GET /Request?id=100 (polling - completed)
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ Id: 100, Status: 'Completed' })
     })
 
-    // GET /ResultStatuses
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => [
@@ -81,6 +75,7 @@ describe('main', () => {
 
     await run()
 
+    expect(mockedCore.setSecret).toHaveBeenCalledWith('test-secret')
     expect(mockedCore.setOutput).toHaveBeenCalledWith('request-id', '100')
     expect(mockedCore.setOutput).toHaveBeenCalledWith('status', 'Completed')
     expect(mockedCore.setFailed).not.toHaveBeenCalled()
@@ -90,19 +85,16 @@ describe('main', () => {
     setupInputs()
     mockTokenEndpoint()
 
-    // POST /Request
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ Id: 200, Status: 'Pending' })
     })
 
-    // GET /Request?id=200 (polling - errored)
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ Id: 200, Status: 'Errored' })
     })
 
-    // GET /ResultStatuses
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => [
@@ -114,6 +106,79 @@ describe('main', () => {
 
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       'Deployment finished with status: Errored'
+    )
+  })
+
+  it('fails with invalid poll-interval', async () => {
+    setupInputs({ 'poll-interval': 'abc' })
+
+    await run()
+
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      'poll-interval must be a positive integer (minimum 1)'
+    )
+  })
+
+  it('fails with invalid timeout', async () => {
+    setupInputs({ timeout: '-5' })
+
+    await run()
+
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      'timeout must be a positive integer (minimum 1)'
+    )
+  })
+
+  it('fails with empty components', async () => {
+    setupInputs({ components: ';;;' })
+
+    await run()
+
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      'components must contain at least one non-empty component name'
+    )
+  })
+
+  it('fails on invalid request ID', async () => {
+    setupInputs()
+    mockTokenEndpoint()
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ Id: 0, Status: 'Invalid' })
+    })
+
+    await run()
+
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      'DOrc API returned an invalid request ID'
+    )
+  })
+
+  it('still reports deployment failure when logComponentResults throws', async () => {
+    setupInputs()
+    mockTokenEndpoint()
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ Id: 300, Status: 'Pending' })
+    })
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ Id: 300, Status: 'Failed' })
+    })
+
+    // logComponentResults fails
+    mockFetch.mockRejectedValueOnce(new Error('Network error'))
+
+    await run()
+
+    expect(mockedCore.warning).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to fetch component results')
+    )
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      'Deployment finished with status: Failed'
     )
   })
 })

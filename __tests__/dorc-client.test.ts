@@ -1,9 +1,9 @@
 import { DorcClient } from '../src/dorc-client'
 
-// Mock @actions/core
 jest.mock('@actions/core', () => ({
   info: jest.fn(),
-  debug: jest.fn()
+  debug: jest.fn(),
+  warning: jest.fn()
 }))
 
 const mockFetch = jest.fn()
@@ -59,7 +59,6 @@ describe('DorcClient', () => {
       expect(result.Id).toBe(42)
       expect(result.Status).toBe('Pending')
 
-      // Second call should be the POST to /Request
       const postCall = mockFetch.mock.calls[1]
       expect(postCall[0]).toBe('https://dorc.example.com/Request')
       expect(postCall[1].method).toBe('POST')
@@ -99,6 +98,102 @@ describe('DorcClient', () => {
 
       const result = await client.getRequestStatus(42)
       expect(result.Id).toBe(42)
+    })
+  })
+
+  describe('retries on transient errors', () => {
+    it('retries on 503 and succeeds', async () => {
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      // First attempt: 503
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        statusText: 'Service Unavailable',
+        json: async () => ({}),
+        text: async () => 'Service Unavailable'
+      })
+      // Retry succeeds (needs a fresh ensureToken call since token is still valid)
+      mockApiResponse({ Id: 42, Status: 'Pending' })
+
+      const result = await client.getRequestStatus(42)
+      expect(result.Id).toBe(42)
+    })
+
+    it('retries on network errors', async () => {
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      // First attempt: network error
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'))
+      // Retry succeeds
+      mockApiResponse({ Id: 42, Status: 'Pending' })
+
+      const result = await client.getRequestStatus(42)
+      expect(result.Id).toBe(42)
+    })
+  })
+
+  describe('pollUntilComplete', () => {
+    it('polls until a terminal status is reached', async () => {
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      // First poll: InProgress
+      mockApiResponse({ Id: 1, Status: 'InProgress' })
+      // Second poll: Completed
+      mockApiResponse({ Id: 1, Status: 'Completed' })
+
+      const status = await client.pollUntilComplete(1, 0.01, 1)
+      expect(status).toBe('Completed')
+    })
+
+    it('returns on failure statuses', async () => {
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      mockApiResponse({ Id: 1, Status: 'Errored' })
+
+      const status = await client.pollUntilComplete(1, 0.01, 1)
+      expect(status).toBe('Errored')
+    })
+
+    it('throws on timeout', async () => {
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      // Keep returning InProgress forever
+      for (let i = 0; i < 20; i++) {
+        mockApiResponse({ Id: 1, Status: 'InProgress' })
+      }
+
+      // Timeout after 0.001 minutes (60ms)
+      await expect(
+        client.pollUntilComplete(1, 0.01, 0.001)
+      ).rejects.toThrow('Deployment timed out')
+    })
+  })
+
+  describe('logComponentResults', () => {
+    it('logs component results', async () => {
+      const core = jest.requireMock('@actions/core')
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      mockApiResponse([
+        { ComponentName: 'Comp1', Status: 'Completed', Log: 'Done' },
+        { ComponentName: 'Comp2', Status: 'Errored', Log: 'Failed' }
+      ])
+
+      await client.logComponentResults(1)
+
+      expect(core.info).toHaveBeenCalledWith(
+        expect.stringContaining('Comp1')
+      )
+      expect(core.info).toHaveBeenCalledWith(
+        expect.stringContaining('Comp2')
+      )
     })
   })
 

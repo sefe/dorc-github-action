@@ -25653,6 +25653,7 @@ exports.fetchAccessToken = fetchAccessToken;
 exports.isTokenExpired = isTokenExpired;
 exports.resolveTokenUrl = resolveTokenUrl;
 const REFRESH_WINDOW_SECONDS = 120;
+const FETCH_TIMEOUT_MS = 30_000;
 async function fetchAccessToken(config) {
     const body = new URLSearchParams({
         grant_type: 'client_credentials',
@@ -25663,16 +25664,24 @@ async function fetchAccessToken(config) {
     const response = await fetch(config.tokenUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body.toString()
+        body: body.toString(),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
     });
     if (!response.ok) {
         throw new Error(`Failed to obtain access token: ${response.status} ${response.statusText}`);
     }
-    const data = (await response.json());
-    const expiresIn = data.expires_in ?? 3600;
+    const data = await response.json();
+    if (typeof data !== 'object' ||
+        data === null ||
+        !('access_token' in data) ||
+        typeof data.access_token !== 'string') {
+        throw new Error('Invalid token response: missing or invalid access_token field');
+    }
+    const tokenData = data;
+    const expiresIn = tokenData.expires_in ?? 3600;
     const safeExpiry = Math.max(expiresIn - REFRESH_WINDOW_SECONDS, 30);
     return {
-        accessToken: data.access_token,
+        accessToken: tokenData.access_token,
         expiresAt: new Date(Date.now() + safeExpiry * 1000)
     };
 }
@@ -25680,11 +25689,21 @@ function isTokenExpired(state) {
     return new Date() >= state.expiresAt;
 }
 async function resolveTokenUrl(baseUrl) {
-    const response = await fetch(`${baseUrl}/ApiConfig`);
+    const url = `${baseUrl.replace(/\/+$/, '')}/ApiConfig`;
+    const response = await fetch(url, {
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    });
     if (!response.ok) {
         throw new Error(`Failed to get API config: ${response.status} ${response.statusText}`);
     }
-    const config = (await response.json());
+    const config = await response.json();
+    if (typeof config !== 'object' ||
+        config === null ||
+        !('OAuthAuthority' in config) ||
+        typeof config.OAuthAuthority !== 'string' ||
+        !config.OAuthAuthority) {
+        throw new Error('DOrc API config response missing or empty OAuthAuthority field');
+    }
     return `${config.OAuthAuthority}/connect/token`;
 }
 
@@ -25736,6 +25755,20 @@ const auth_1 = __nccwpck_require__(9081);
 const GOOD_STATUSES = ['Completed'];
 const BAD_STATUSES = ['Errored', 'Cancelled', 'Failed'];
 const TERMINAL_STATUSES = [...GOOD_STATUSES, ...BAD_STATUSES];
+const FETCH_TIMEOUT_MS = 60_000;
+const RETRYABLE_STATUS_CODES = [502, 503, 504];
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 1000;
+function isRetryableError(error) {
+    if (error instanceof Error && error.name === 'TimeoutError')
+        return true;
+    if (error instanceof TypeError)
+        return true; // network failures
+    return false;
+}
+async function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 class DorcClient {
     baseUrl;
     tokenConfig;
@@ -25752,37 +25785,84 @@ class DorcClient {
         return this.tokenState.accessToken;
     }
     async request(method, path, body) {
-        const token = await this.ensureToken();
         const url = `${this.baseUrl}${path}`;
-        const options = {
-            method,
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json'
-            }
-        };
-        if (body) {
-            options.body = JSON.stringify(body);
-        }
-        let response = await fetch(url, options);
-        // Retry once on 401 with a fresh token
-        if (response.status === 401) {
-            core.info('Received 401, refreshing token and retrying...');
-            this.tokenState = await (0, auth_1.fetchAccessToken)(this.tokenConfig);
-            options.headers = {
-                Authorization: `Bearer ${this.tokenState.accessToken}`,
-                'Content-Type': 'application/json'
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            const token = await this.ensureToken();
+            const options = {
+                method,
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                },
+                signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
             };
-            response = await fetch(url, options);
+            if (body) {
+                options.body = JSON.stringify(body);
+            }
+            let response;
+            try {
+                response = await fetch(url, options);
+            }
+            catch (error) {
+                if (attempt < MAX_RETRIES && isRetryableError(error)) {
+                    const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000;
+                    core.warning(`Request to ${path} failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${error}. Retrying in ${Math.round(delay)}ms...`);
+                    await sleep(delay);
+                    continue;
+                }
+                throw error;
+            }
+            // Retry once on 401 with a fresh token
+            if (response.status === 401) {
+                core.info('Received 401, refreshing token and retrying...');
+                this.tokenState = await (0, auth_1.fetchAccessToken)(this.tokenConfig);
+                const retryOptions = {
+                    method,
+                    headers: {
+                        Authorization: `Bearer ${this.tokenState.accessToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+                };
+                if (body) {
+                    retryOptions.body = JSON.stringify(body);
+                }
+                response = await fetch(url, retryOptions);
+            }
+            // Retry on transient server errors
+            if (RETRYABLE_STATUS_CODES.includes(response.status) &&
+                attempt < MAX_RETRIES) {
+                const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000;
+                core.warning(`DOrc API returned ${response.status} for ${path} (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Retrying in ${Math.round(delay)}ms...`);
+                await sleep(delay);
+                continue;
+            }
+            if (!response.ok) {
+                let errorText = 'No error details';
+                try {
+                    errorText = await response.text();
+                    if (errorText.length > 500) {
+                        errorText = errorText.substring(0, 500) + '...';
+                    }
+                }
+                catch {
+                    errorText = 'Could not read response body';
+                }
+                throw new Error(`DOrc API ${method} ${path} failed: ${response.status} ${response.statusText} - ${errorText}`);
+            }
+            let json;
+            try {
+                json = await response.json();
+            }
+            catch {
+                throw new Error(`DOrc API ${method} ${path} returned non-JSON response`);
+            }
+            return json;
         }
-        if (!response.ok) {
-            const text = await response.text();
-            throw new Error(`DOrc API ${method} ${path} failed: ${response.status} ${response.statusText} - ${text}`);
-        }
-        return (await response.json());
+        throw new Error(`DOrc API ${method} ${path} failed after ${MAX_RETRIES + 1} attempts`);
     }
     async createRequest(req) {
-        core.info(`Creating DOrc request: ${JSON.stringify(req)}`);
+        core.debug(`Creating DOrc request: ${JSON.stringify(req)}`);
         return this.request('POST', '/Request', req);
     }
     async getRequestStatus(requestId) {
@@ -25791,10 +25871,11 @@ class DorcClient {
     async getResultStatuses(requestId) {
         return this.request('GET', `/ResultStatuses?requestId=${requestId}`);
     }
-    async pollUntilComplete(requestId, pollIntervalSeconds) {
+    async pollUntilComplete(requestId, pollIntervalSeconds, timeoutMinutes) {
         let lastStatus = '';
-        while (true) {
-            await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
+        const deadline = Date.now() + timeoutMinutes * 60 * 1000;
+        while (Date.now() <= deadline) {
+            await sleep(pollIntervalSeconds * 1000);
             const status = await this.getRequestStatus(requestId);
             if (status.Status !== lastStatus) {
                 core.info(`Request ${requestId} status changed to: ${status.Status}`);
@@ -25804,6 +25885,7 @@ class DorcClient {
                 return lastStatus;
             }
         }
+        throw new Error(`Deployment timed out after ${timeoutMinutes} minutes. Last status: ${lastStatus || 'unknown'}`);
     }
     async logComponentResults(requestId) {
         const results = await this.getResultStatuses(requestId);
@@ -25868,8 +25950,11 @@ const auth_1 = __nccwpck_require__(9081);
 const dorc_client_1 = __nccwpck_require__(3149);
 async function run() {
     try {
-        const baseUrl = core.getInput('base-url', { required: true }).replace(/\/+$/, '');
+        const baseUrl = core
+            .getInput('base-url', { required: true })
+            .replace(/\/+$/, '');
         const clientSecret = core.getInput('dorc-ids-secret', { required: true });
+        core.setSecret(clientSecret);
         const project = core.getInput('project', { required: true });
         const environment = core.getInput('environment', { required: true });
         const components = core.getInput('components', { required: true });
@@ -25878,8 +25963,23 @@ async function run() {
         const pinned = core.getBooleanInput('pinned');
         const buildUri = core.getInput('build-uri');
         const pollInterval = parseInt(core.getInput('poll-interval') || '5', 10);
-        // Mask the secret from logs
-        core.setSecret(clientSecret);
+        if (isNaN(pollInterval) || pollInterval < 1) {
+            core.setFailed('poll-interval must be a positive integer (minimum 1)');
+            return;
+        }
+        const timeout = parseInt(core.getInput('timeout') || '60', 10);
+        if (isNaN(timeout) || timeout < 1) {
+            core.setFailed('timeout must be a positive integer (minimum 1)');
+            return;
+        }
+        const componentList = components
+            .split(';')
+            .map(c => c.trim())
+            .filter(c => c);
+        if (componentList.length === 0) {
+            core.setFailed('components must contain at least one non-empty component name');
+            return;
+        }
         core.info(`DOrc API URL: ${baseUrl}`);
         // Resolve the Identity Server token URL
         const tokenUrl = await (0, auth_1.resolveTokenUrl)(baseUrl);
@@ -25893,7 +25993,7 @@ async function run() {
             BuildText: buildText,
             BuildNum: buildNum,
             Pinned: pinned,
-            Components: components.split(';').map(c => c.trim()).filter(c => c)
+            Components: componentList
         };
         // Create the deployment request
         const result = await client.createRequest(request);
@@ -25904,11 +26004,17 @@ async function run() {
         core.info(`Request ${result.Id} created`);
         core.setOutput('request-id', result.Id.toString());
         // Poll until completion
-        const finalStatus = await client.pollUntilComplete(result.Id, pollInterval);
+        const finalStatus = await client.pollUntilComplete(result.Id, pollInterval, timeout);
         core.setOutput('status', finalStatus);
-        // Log component results
-        core.info('Collecting deploy results...');
-        await client.logComponentResults(result.Id);
+        // Log component results — wrapped so a failure here doesn't mask the
+        // deployment status that has already been determined
+        try {
+            core.info('Collecting deploy results...');
+            await client.logComponentResults(result.Id);
+        }
+        catch (logError) {
+            core.warning(`Failed to fetch component results: ${logError instanceof Error ? logError.message : logError}`);
+        }
         if (client.isSuccessStatus(finalStatus)) {
             core.info(`Deployment completed successfully: ${finalStatus}`);
         }
