@@ -82,5 +82,16 @@ export async function resolveTokenUrl(baseUrl: string): Promise<string> {
       'DOrc API config response missing or empty OAuthAuthority field'
     )
   }
-  return `${(config as { OAuthAuthority: string }).OAuthAuthority}/connect/token`
+
+  const authority = (
+    config as { OAuthAuthority: string }
+  ).OAuthAuthority.replace(/\/+$/, '')
+
+  try {
+    new URL(authority)
+  } catch {
+    throw new Error(`OAuthAuthority is not a valid URL: ${authority}`)
+  }
+
+  return `${authority}/connect/token`
 }

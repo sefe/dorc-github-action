@@ -39,7 +39,7 @@ inputs:
     required: false
     default: ''
   poll-interval:
-    description: 'Seconds between status polls (minimum 1)'
+    description: 'Seconds between status polls (minimum 5)'
     required: false
     default: '5'
   timeout:

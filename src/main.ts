@@ -10,17 +10,24 @@ export async function run(): Promise<void> {
     const clientSecret = core.getInput('dorc-ids-secret', { required: true })
     core.setSecret(clientSecret)
 
+    try {
+      new URL(baseUrl)
+    } catch {
+      core.setFailed(`base-url is not a valid URL: ${baseUrl}`)
+      return
+    }
+
     const project = core.getInput('project', { required: true })
     const environment = core.getInput('environment', { required: true })
     const components = core.getInput('components', { required: true })
-    const buildText = core.getInput('build-text')
-    const buildNum = core.getInput('build-num')
+    const buildText = core.getInput('build-text') || null
+    const buildNum = core.getInput('build-num') || null
     const pinned = core.getBooleanInput('pinned')
-    const buildUri = core.getInput('build-uri')
+    const buildUri = core.getInput('build-uri') || null
 
     const pollInterval = parseInt(core.getInput('poll-interval') || '5', 10)
-    if (isNaN(pollInterval) || pollInterval < 1) {
-      core.setFailed('poll-interval must be a positive integer (minimum 1)')
+    if (isNaN(pollInterval) || pollInterval < 5) {
+      core.setFailed('poll-interval must be a positive integer (minimum 5)')
       return
     }
 
@@ -49,7 +56,8 @@ export async function run(): Promise<void> {
 
     const client = new DorcClient(baseUrl, { tokenUrl, clientSecret })
 
-    // Build the request
+    // Build the request — null fields are serialized as JSON null,
+    // matching the PowerShell extension's $null behaviour
     const request: DeployRequest = {
       Project: project,
       Environment: environment,
@@ -90,7 +98,7 @@ export async function run(): Promise<void> {
       )
     }
 
-    if (client.isSuccessStatus(finalStatus)) {
+    if (DorcClient.isSuccessStatus(finalStatus)) {
       core.info(`Deployment completed successfully: ${finalStatus}`)
     } else {
       core.setFailed(`Deployment finished with status: ${finalStatus}`)

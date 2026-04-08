@@ -1,17 +1,13 @@
 import * as core from '@actions/core'
-import {
-  TokenConfig,
-  TokenState,
-  fetchAccessToken,
-  isTokenExpired
-} from './auth'
+import { TokenConfig, fetchAccessToken, isTokenExpired } from './auth'
+import type { TokenState } from './auth'
 
 export interface DeployRequest {
   Project: string
   Environment: string
-  BuildUrl: string
-  BuildText: string
-  BuildNum: string
+  BuildUrl: string | null
+  BuildText: string | null
+  BuildNum: string | null
   Pinned: boolean
   Components: string[]
 }
@@ -31,7 +27,7 @@ const GOOD_STATUSES = ['Completed']
 const BAD_STATUSES = ['Errored', 'Cancelled', 'Failed']
 const TERMINAL_STATUSES = [...GOOD_STATUSES, ...BAD_STATUSES]
 const FETCH_TIMEOUT_MS = 60_000
-const RETRYABLE_STATUS_CODES = [502, 503, 504]
+const RETRYABLE_STATUS_CODES = [401, 502, 503, 504]
 const MAX_RETRIES = 3
 const RETRY_BASE_DELAY_MS = 1000
 
@@ -43,6 +39,17 @@ function isRetryableError(error: unknown): boolean {
 
 async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function isValidRequestStatus(value: unknown): value is RequestStatus {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'Id' in value &&
+    typeof (value as Record<string, unknown>).Id === 'number' &&
+    'Status' in value &&
+    typeof (value as Record<string, unknown>).Status === 'string'
+  )
 }
 
 export class DorcClient {
@@ -87,8 +94,7 @@ export class DorcClient {
         response = await fetch(url, options)
       } catch (error) {
         if (attempt < MAX_RETRIES && isRetryableError(error)) {
-          const delay =
-            RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000
+          const delay = retryDelay(attempt)
           core.warning(
             `Request to ${path} failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${error}. Retrying in ${Math.round(delay)}ms...`
           )
@@ -98,22 +104,14 @@ export class DorcClient {
         throw error
       }
 
-      // Retry once on 401 with a fresh token
-      if (response.status === 401) {
-        core.info('Received 401, refreshing token and retrying...')
-        this.tokenState = await fetchAccessToken(this.tokenConfig)
-        const retryOptions: RequestInit = {
-          method,
-          headers: {
-            Authorization: `Bearer ${this.tokenState.accessToken}`,
-            'Content-Type': 'application/json'
-          },
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-        }
-        if (body) {
-          retryOptions.body = JSON.stringify(body)
-        }
-        response = await fetch(url, retryOptions)
+      // On 401, invalidate token so ensureToken() fetches a fresh one next iteration
+      if (response.status === 401 && attempt < MAX_RETRIES) {
+        core.info(
+          `Received 401 for ${path}, invalidating token and retrying...`
+        )
+        this.tokenState = null
+        await sleep(retryDelay(attempt))
+        continue
       }
 
       // Retry on transient server errors
@@ -121,8 +119,7 @@ export class DorcClient {
         RETRYABLE_STATUS_CODES.includes(response.status) &&
         attempt < MAX_RETRIES
       ) {
-        const delay =
-          RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000
+        const delay = retryDelay(attempt)
         core.warning(
           `DOrc API returned ${response.status} for ${path} (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Retrying in ${Math.round(delay)}ms...`
         )
@@ -149,30 +146,51 @@ export class DorcClient {
       try {
         json = await response.json()
       } catch {
-        throw new Error(
-          `DOrc API ${method} ${path} returned non-JSON response`
-        )
+        throw new Error(`DOrc API ${method} ${path} returned non-JSON response`)
       }
       return json as T
     }
 
-    throw new Error(`DOrc API ${method} ${path} failed after ${MAX_RETRIES + 1} attempts`)
+    throw new Error(
+      `DOrc API ${method} ${path} failed after ${MAX_RETRIES + 1} attempts`
+    )
   }
 
   async createRequest(req: DeployRequest): Promise<RequestStatus> {
     core.debug(`Creating DOrc request: ${JSON.stringify(req)}`)
-    return this.request<RequestStatus>('POST', '/Request', req)
+    const result = await this.request<unknown>('POST', '/Request', req)
+    if (!isValidRequestStatus(result)) {
+      throw new Error(
+        `DOrc API returned unexpected response for POST /Request: ${JSON.stringify(result)}`
+      )
+    }
+    return result
   }
 
   async getRequestStatus(requestId: number): Promise<RequestStatus> {
-    return this.request<RequestStatus>('GET', `/Request?id=${requestId}`)
+    const result = await this.request<unknown>(
+      'GET',
+      `/Request?id=${requestId}`
+    )
+    if (!isValidRequestStatus(result)) {
+      throw new Error(
+        `DOrc API returned unexpected response for GET /Request?id=${requestId}: ${JSON.stringify(result)}`
+      )
+    }
+    return result
   }
 
   async getResultStatuses(requestId: number): Promise<ComponentResult[]> {
-    return this.request<ComponentResult[]>(
+    const result = await this.request<unknown>(
       'GET',
       `/ResultStatuses?requestId=${requestId}`
     )
+    if (!Array.isArray(result)) {
+      throw new Error(
+        `DOrc API returned unexpected response for GET /ResultStatuses: expected array`
+      )
+    }
+    return result as ComponentResult[]
   }
 
   async pollUntilComplete(
@@ -182,9 +200,15 @@ export class DorcClient {
   ): Promise<string> {
     let lastStatus = ''
     const deadline = Date.now() + timeoutMinutes * 60 * 1000
+    const jitterMs = 1000
 
-    while (Date.now() <= deadline) {
-      await sleep(pollIntervalSeconds * 1000)
+    // Check immediately, then sleep between subsequent polls
+    let firstPoll = true
+    while (Date.now() < deadline) {
+      if (!firstPoll) {
+        await sleep(pollIntervalSeconds * 1000 + Math.random() * jitterMs)
+      }
+      firstPoll = false
 
       const status = await this.getRequestStatus(requestId)
 
@@ -205,6 +229,10 @@ export class DorcClient {
 
   async logComponentResults(requestId: number): Promise<void> {
     const results = await this.getResultStatuses(requestId)
+    if (results.length === 0) {
+      core.info('No component results returned.')
+      return
+    }
     for (const cmp of results) {
       core.info('='.repeat(75))
       core.info(`  ${cmp.ComponentName} — ${cmp.Status}`)
@@ -213,7 +241,11 @@ export class DorcClient {
     }
   }
 
-  isSuccessStatus(status: string): boolean {
+  static isSuccessStatus(status: string): boolean {
     return GOOD_STATUSES.includes(status)
   }
+}
+
+function retryDelay(attempt: number): number {
+  return RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000
 }

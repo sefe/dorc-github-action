@@ -31279,7 +31279,14 @@ async function resolveTokenUrl(baseUrl) {
         !config.OAuthAuthority) {
         throw new Error('DOrc API config response missing or empty OAuthAuthority field');
     }
-    return `${config.OAuthAuthority}/connect/token`;
+    const authority = config.OAuthAuthority.replace(/\/+$/, '');
+    try {
+        new URL(authority);
+    }
+    catch {
+        throw new Error(`OAuthAuthority is not a valid URL: ${authority}`);
+    }
+    return `${authority}/connect/token`;
 }
 
 
@@ -31331,7 +31338,7 @@ const GOOD_STATUSES = ['Completed'];
 const BAD_STATUSES = ['Errored', 'Cancelled', 'Failed'];
 const TERMINAL_STATUSES = [...GOOD_STATUSES, ...BAD_STATUSES];
 const FETCH_TIMEOUT_MS = 60_000;
-const RETRYABLE_STATUS_CODES = [502, 503, 504];
+const RETRYABLE_STATUS_CODES = [401, 502, 503, 504];
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 function isRetryableError(error) {
@@ -31343,6 +31350,14 @@ function isRetryableError(error) {
 }
 async function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+function isValidRequestStatus(value) {
+    return (typeof value === 'object' &&
+        value !== null &&
+        'Id' in value &&
+        typeof value.Id === 'number' &&
+        'Status' in value &&
+        typeof value.Status === 'string');
 }
 class DorcClient {
     baseUrl;
@@ -31380,34 +31395,24 @@ class DorcClient {
             }
             catch (error) {
                 if (attempt < MAX_RETRIES && isRetryableError(error)) {
-                    const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000;
+                    const delay = retryDelay(attempt);
                     core.warning(`Request to ${path} failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${error}. Retrying in ${Math.round(delay)}ms...`);
                     await sleep(delay);
                     continue;
                 }
                 throw error;
             }
-            // Retry once on 401 with a fresh token
-            if (response.status === 401) {
-                core.info('Received 401, refreshing token and retrying...');
-                this.tokenState = await (0, auth_1.fetchAccessToken)(this.tokenConfig);
-                const retryOptions = {
-                    method,
-                    headers: {
-                        Authorization: `Bearer ${this.tokenState.accessToken}`,
-                        'Content-Type': 'application/json'
-                    },
-                    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-                };
-                if (body) {
-                    retryOptions.body = JSON.stringify(body);
-                }
-                response = await fetch(url, retryOptions);
+            // On 401, invalidate token so ensureToken() fetches a fresh one next iteration
+            if (response.status === 401 && attempt < MAX_RETRIES) {
+                core.info(`Received 401 for ${path}, invalidating token and retrying...`);
+                this.tokenState = null;
+                await sleep(retryDelay(attempt));
+                continue;
             }
             // Retry on transient server errors
             if (RETRYABLE_STATUS_CODES.includes(response.status) &&
                 attempt < MAX_RETRIES) {
-                const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000;
+                const delay = retryDelay(attempt);
                 core.warning(`DOrc API returned ${response.status} for ${path} (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Retrying in ${Math.round(delay)}ms...`);
                 await sleep(delay);
                 continue;
@@ -31438,19 +31443,37 @@ class DorcClient {
     }
     async createRequest(req) {
         core.debug(`Creating DOrc request: ${JSON.stringify(req)}`);
-        return this.request('POST', '/Request', req);
+        const result = await this.request('POST', '/Request', req);
+        if (!isValidRequestStatus(result)) {
+            throw new Error(`DOrc API returned unexpected response for POST /Request: ${JSON.stringify(result)}`);
+        }
+        return result;
     }
     async getRequestStatus(requestId) {
-        return this.request('GET', `/Request?id=${requestId}`);
+        const result = await this.request('GET', `/Request?id=${requestId}`);
+        if (!isValidRequestStatus(result)) {
+            throw new Error(`DOrc API returned unexpected response for GET /Request?id=${requestId}: ${JSON.stringify(result)}`);
+        }
+        return result;
     }
     async getResultStatuses(requestId) {
-        return this.request('GET', `/ResultStatuses?requestId=${requestId}`);
+        const result = await this.request('GET', `/ResultStatuses?requestId=${requestId}`);
+        if (!Array.isArray(result)) {
+            throw new Error(`DOrc API returned unexpected response for GET /ResultStatuses: expected array`);
+        }
+        return result;
     }
     async pollUntilComplete(requestId, pollIntervalSeconds, timeoutMinutes) {
         let lastStatus = '';
         const deadline = Date.now() + timeoutMinutes * 60 * 1000;
-        while (Date.now() <= deadline) {
-            await sleep(pollIntervalSeconds * 1000);
+        const jitterMs = 1000;
+        // Check immediately, then sleep between subsequent polls
+        let firstPoll = true;
+        while (Date.now() < deadline) {
+            if (!firstPoll) {
+                await sleep(pollIntervalSeconds * 1000 + Math.random() * jitterMs);
+            }
+            firstPoll = false;
             const status = await this.getRequestStatus(requestId);
             if (status.Status !== lastStatus) {
                 core.info(`Request ${requestId} status changed to: ${status.Status}`);
@@ -31464,6 +31487,10 @@ class DorcClient {
     }
     async logComponentResults(requestId) {
         const results = await this.getResultStatuses(requestId);
+        if (results.length === 0) {
+            core.info('No component results returned.');
+            return;
+        }
         for (const cmp of results) {
             core.info('='.repeat(75));
             core.info(`  ${cmp.ComponentName} — ${cmp.Status}`);
@@ -31471,11 +31498,60 @@ class DorcClient {
             core.info(cmp.Log);
         }
     }
-    isSuccessStatus(status) {
+    static isSuccessStatus(status) {
         return GOOD_STATUSES.includes(status);
     }
 }
 exports.DorcClient = DorcClient;
+function retryDelay(attempt) {
+    return RETRY_BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000;
+}
+
+
+/***/ }),
+
+/***/ 9407:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const core = __importStar(__nccwpck_require__(7484));
+const main_1 = __nccwpck_require__(1730);
+(0, main_1.run)().catch(err => core.setFailed(err instanceof Error ? err.message : String(err)));
 
 
 /***/ }),
@@ -31530,16 +31606,23 @@ async function run() {
             .replace(/\/+$/, '');
         const clientSecret = core.getInput('dorc-ids-secret', { required: true });
         core.setSecret(clientSecret);
+        try {
+            new URL(baseUrl);
+        }
+        catch {
+            core.setFailed(`base-url is not a valid URL: ${baseUrl}`);
+            return;
+        }
         const project = core.getInput('project', { required: true });
         const environment = core.getInput('environment', { required: true });
         const components = core.getInput('components', { required: true });
-        const buildText = core.getInput('build-text');
-        const buildNum = core.getInput('build-num');
+        const buildText = core.getInput('build-text') || null;
+        const buildNum = core.getInput('build-num') || null;
         const pinned = core.getBooleanInput('pinned');
-        const buildUri = core.getInput('build-uri');
+        const buildUri = core.getInput('build-uri') || null;
         const pollInterval = parseInt(core.getInput('poll-interval') || '5', 10);
-        if (isNaN(pollInterval) || pollInterval < 1) {
-            core.setFailed('poll-interval must be a positive integer (minimum 1)');
+        if (isNaN(pollInterval) || pollInterval < 5) {
+            core.setFailed('poll-interval must be a positive integer (minimum 5)');
             return;
         }
         const timeout = parseInt(core.getInput('timeout') || '60', 10);
@@ -31560,7 +31643,8 @@ async function run() {
         const tokenUrl = await (0, auth_1.resolveTokenUrl)(baseUrl);
         core.info(`IDS token URL: ${tokenUrl}`);
         const client = new dorc_client_1.DorcClient(baseUrl, { tokenUrl, clientSecret });
-        // Build the request
+        // Build the request — null fields are serialized as JSON null,
+        // matching the PowerShell extension's $null behaviour
         const request = {
             Project: project,
             Environment: environment,
@@ -31590,7 +31674,7 @@ async function run() {
         catch (logError) {
             core.warning(`Failed to fetch component results: ${logError instanceof Error ? logError.message : logError}`);
         }
-        if (client.isSuccessStatus(finalStatus)) {
+        if (dorc_client_1.DorcClient.isSuccessStatus(finalStatus)) {
             core.info(`Deployment completed successfully: ${finalStatus}`);
         }
         else {
@@ -31920,19 +32004,13 @@ module.exports = require("util");
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";
 /******/ 	
 /************************************************************************/
-var __webpack_exports__ = {};
-// This entry need to be wrapped in an IIFE because it need to be in strict mode.
-(() => {
-"use strict";
-var exports = __webpack_exports__;
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-const main_1 = __nccwpck_require__(1730);
-(0, main_1.run)();
-
-})();
-
-module.exports = __webpack_exports__;
+/******/ 	
+/******/ 	// startup
+/******/ 	// Load entry module and return exports
+/******/ 	// This entry module is referenced by other modules so it can't be inlined
+/******/ 	var __webpack_exports__ = __nccwpck_require__(9407);
+/******/ 	module.exports = __webpack_exports__;
+/******/ 	
 /******/ })()
 ;
 //# sourceMappingURL=index.js.map

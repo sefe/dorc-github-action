@@ -1,8 +1,14 @@
 import { fetchAccessToken, isTokenExpired, resolveTokenUrl } from '../src/auth'
 
+const originalFetch = global.fetch
 const mockFetch = jest.fn()
-global.fetch = mockFetch
 
+beforeAll(() => {
+  global.fetch = mockFetch
+})
+afterAll(() => {
+  global.fetch = originalFetch
+})
 beforeEach(() => {
   mockFetch.mockReset()
 })
@@ -33,6 +39,16 @@ describe('resolveTokenUrl', () => {
       'https://dorc.example.com/ApiConfig',
       expect.anything()
     )
+  })
+
+  it('strips trailing slash from OAuthAuthority', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ OAuthAuthority: 'https://ids.example.com/' })
+    })
+
+    const url = await resolveTokenUrl('https://dorc.example.com')
+    expect(url).toBe('https://ids.example.com/connect/token')
   })
 
   it('throws on non-OK response', async () => {
@@ -68,6 +84,17 @@ describe('resolveTokenUrl', () => {
       'missing or empty OAuthAuthority'
     )
   })
+
+  it('throws when OAuthAuthority is not a valid URL', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ OAuthAuthority: 'not-a-url' })
+    })
+
+    await expect(resolveTokenUrl('https://dorc.example.com')).rejects.toThrow(
+      'not a valid URL'
+    )
+  })
 })
 
 describe('fetchAccessToken', () => {
@@ -80,12 +107,10 @@ describe('fetchAccessToken', () => {
       })
     })
 
-    const config = {
+    const result = await fetchAccessToken({
       tokenUrl: 'https://ids.example.com/connect/token',
       clientSecret: 'secret123'
-    }
-
-    const result = await fetchAccessToken(config)
+    })
     expect(result.accessToken).toBe('test-token-123')
     expect(result.expiresAt).toBeInstanceOf(Date)
     const expectedMs = Date.now() + 3480 * 1000
@@ -103,8 +128,23 @@ describe('fetchAccessToken', () => {
       tokenUrl: 'https://ids.example.com/connect/token',
       clientSecret: 'secret'
     })
-
     expect(result.accessToken).toBe('tok')
+  })
+
+  it('floors safeExpiry at 30 seconds for very short expires_in', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ access_token: 'tok', expires_in: 1 })
+    })
+
+    const result = await fetchAccessToken({
+      tokenUrl: 'https://ids.example.com/connect/token',
+      clientSecret: 'secret'
+    })
+    // safeExpiry = max(1 - 120, 30) = 30
+    const expectedMs = Date.now() + 30 * 1000
+    expect(result.expiresAt.getTime()).toBeGreaterThan(expectedMs - 5000)
+    expect(result.expiresAt.getTime()).toBeLessThan(expectedMs + 5000)
   })
 
   it('throws on non-OK response', async () => {

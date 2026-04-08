@@ -3,8 +3,15 @@ import { run } from '../src/main'
 
 jest.mock('@actions/core')
 
+const originalFetch = global.fetch
 const mockFetch = jest.fn()
-global.fetch = mockFetch
+
+beforeAll(() => {
+  global.fetch = mockFetch
+})
+afterAll(() => {
+  global.fetch = originalFetch
+})
 
 const mockedCore = jest.mocked(core)
 
@@ -25,7 +32,7 @@ describe('main', () => {
       'build-num': 'latest',
       pinned: 'false',
       'build-uri': '',
-      'poll-interval': '1',
+      'poll-interval': '5',
       timeout: '60'
     }
     const inputs = { ...defaults, ...overrides }
@@ -81,6 +88,33 @@ describe('main', () => {
     expect(mockedCore.setFailed).not.toHaveBeenCalled()
   })
 
+  it('sends null for empty optional fields', async () => {
+    setupInputs({ 'build-text': '', 'build-num': '', 'build-uri': '' })
+    mockTokenEndpoint()
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ Id: 100, Status: 'Pending' })
+    })
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ Id: 100, Status: 'Completed' })
+    })
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => []
+    })
+
+    await run()
+
+    // Check the POST body sent to /Request
+    const postCall = mockFetch.mock.calls[2]
+    const body = JSON.parse(postCall[1].body)
+    expect(body.BuildText).toBeNull()
+    expect(body.BuildNum).toBeNull()
+    expect(body.BuildUrl).toBeNull()
+  })
+
   it('fails on a failed deployment', async () => {
     setupInputs()
     mockTokenEndpoint()
@@ -109,13 +143,33 @@ describe('main', () => {
     )
   })
 
+  it('fails with invalid base-url', async () => {
+    setupInputs({ 'base-url': 'not-a-url' })
+
+    await run()
+
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining('not a valid URL')
+    )
+  })
+
   it('fails with invalid poll-interval', async () => {
     setupInputs({ 'poll-interval': 'abc' })
 
     await run()
 
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
-      'poll-interval must be a positive integer (minimum 1)'
+      'poll-interval must be a positive integer (minimum 5)'
+    )
+  })
+
+  it('fails with poll-interval below minimum', async () => {
+    setupInputs({ 'poll-interval': '2' })
+
+    await run()
+
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      'poll-interval must be a positive integer (minimum 5)'
     )
   })
 
