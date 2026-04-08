@@ -13,10 +13,16 @@ const FETCH_TIMEOUT_MS = 30_000
 const RESOLVE_MAX_RETRIES = 2
 const RESOLVE_RETRY_DELAY_MS = 2000
 
+const RETRYABLE_HTTP_STATUSES = [502, 503, 504]
+
 function isRetryableNetworkError(error: unknown): boolean {
   if (error instanceof Error && error.name === 'TimeoutError') return true
   if (error instanceof TypeError) return true
   return false
+}
+
+function isRetryableHttpStatus(status: number): boolean {
+  return RETRYABLE_HTTP_STATUSES.includes(status)
 }
 
 export async function fetchAccessToken(
@@ -92,6 +98,16 @@ export async function resolveTokenUrl(baseUrl: string): Promise<string> {
       const response = await fetch(url, {
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
       })
+      if (
+        !response.ok &&
+        isRetryableHttpStatus(response.status) &&
+        attempt < RESOLVE_MAX_RETRIES
+      ) {
+        await new Promise(resolve =>
+          setTimeout(resolve, RESOLVE_RETRY_DELAY_MS)
+        )
+        continue
+      }
       if (!response.ok) {
         throw new Error(
           `Failed to get API config: ${response.status} ${response.statusText}`
@@ -130,5 +146,6 @@ export async function resolveTokenUrl(baseUrl: string): Promise<string> {
     }
   }
 
+  // Unreachable: loop always returns or throws. TypeScript safeguard.
   throw lastError
 }

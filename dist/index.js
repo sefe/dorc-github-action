@@ -31232,12 +31232,16 @@ const REFRESH_WINDOW_SECONDS = 120;
 const FETCH_TIMEOUT_MS = 30_000;
 const RESOLVE_MAX_RETRIES = 2;
 const RESOLVE_RETRY_DELAY_MS = 2000;
+const RETRYABLE_HTTP_STATUSES = [502, 503, 504];
 function isRetryableNetworkError(error) {
     if (error instanceof Error && error.name === 'TimeoutError')
         return true;
     if (error instanceof TypeError)
         return true;
     return false;
+}
+function isRetryableHttpStatus(status) {
+    return RETRYABLE_HTTP_STATUSES.includes(status);
 }
 async function fetchAccessToken(config) {
     const body = new URLSearchParams({
@@ -31293,6 +31297,12 @@ async function resolveTokenUrl(baseUrl) {
             const response = await fetch(url, {
                 signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
             });
+            if (!response.ok &&
+                isRetryableHttpStatus(response.status) &&
+                attempt < RESOLVE_MAX_RETRIES) {
+                await new Promise(resolve => setTimeout(resolve, RESOLVE_RETRY_DELAY_MS));
+                continue;
+            }
             if (!response.ok) {
                 throw new Error(`Failed to get API config: ${response.status} ${response.statusText}`);
             }
@@ -31318,6 +31328,7 @@ async function resolveTokenUrl(baseUrl) {
             throw error;
         }
     }
+    // Unreachable: loop always returns or throws. TypeScript safeguard.
     throw lastError;
 }
 
@@ -31388,7 +31399,7 @@ function isValidRequestStatus(value) {
     return (typeof value === 'object' &&
         value !== null &&
         'Id' in value &&
-        Number.isFinite(value.Id) &&
+        Number.isInteger(value.Id) &&
         'Status' in value &&
         typeof value.Status === 'string');
 }
@@ -31686,12 +31697,16 @@ async function run() {
         const buildNum = core.getInput('build-num') || null;
         const pinned = core.getBooleanInput('pinned');
         const buildUri = core.getInput('build-uri') || null;
-        const pollInterval = parseInt(core.getInput('poll-interval') || '5', 10);
+        const pollIntervalStr = core.getInput('poll-interval') || '5';
+        const pollInterval = /^\d+$/.test(pollIntervalStr)
+            ? parseInt(pollIntervalStr, 10)
+            : NaN;
         if (isNaN(pollInterval) || pollInterval < 5) {
             core.setFailed('poll-interval must be a positive integer (minimum 5)');
             return;
         }
-        const timeout = parseInt(core.getInput('timeout') || '60', 10);
+        const timeoutStr = core.getInput('timeout') || '60';
+        const timeout = /^\d+$/.test(timeoutStr) ? parseInt(timeoutStr, 10) : NaN;
         if (isNaN(timeout) || timeout < 1) {
             core.setFailed('timeout must be a positive integer (minimum 1)');
             return;
@@ -31704,6 +31719,8 @@ async function run() {
             core.setFailed('components must contain at least one non-empty component name');
             return;
         }
+        // Set fallback outputs early so downstream steps always have values
+        core.setOutput('status', 'Unknown');
         core.info(`DOrc API URL: ${baseUrl}`);
         // Resolve the Identity Server token URL
         const tokenUrl = await (0, auth_1.resolveTokenUrl)(baseUrl);
@@ -31728,8 +31745,6 @@ async function run() {
         }
         core.info(`Request ${result.Id} created`);
         core.setOutput('request-id', result.Id.toString());
-        // Set a fallback so downstream steps always see a status output
-        core.setOutput('status', 'Unknown');
         // Poll until completion
         const finalStatus = await client.pollUntilComplete(result.Id, pollInterval, timeout);
         core.setOutput('status', finalStatus);

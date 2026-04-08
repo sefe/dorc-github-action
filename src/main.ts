@@ -25,13 +25,17 @@ export async function run(): Promise<void> {
     const pinned = core.getBooleanInput('pinned')
     const buildUri = core.getInput('build-uri') || null
 
-    const pollInterval = parseInt(core.getInput('poll-interval') || '5', 10)
+    const pollIntervalStr = core.getInput('poll-interval') || '5'
+    const pollInterval = /^\d+$/.test(pollIntervalStr)
+      ? parseInt(pollIntervalStr, 10)
+      : NaN
     if (isNaN(pollInterval) || pollInterval < 5) {
       core.setFailed('poll-interval must be a positive integer (minimum 5)')
       return
     }
 
-    const timeout = parseInt(core.getInput('timeout') || '60', 10)
+    const timeoutStr = core.getInput('timeout') || '60'
+    const timeout = /^\d+$/.test(timeoutStr) ? parseInt(timeoutStr, 10) : NaN
     if (isNaN(timeout) || timeout < 1) {
       core.setFailed('timeout must be a positive integer (minimum 1)')
       return
@@ -47,6 +51,9 @@ export async function run(): Promise<void> {
       )
       return
     }
+
+    // Set fallback outputs early so downstream steps always have values
+    core.setOutput('status', 'Unknown')
 
     core.info(`DOrc API URL: ${baseUrl}`)
 
@@ -78,9 +85,6 @@ export async function run(): Promise<void> {
 
     core.info(`Request ${result.Id} created`)
     core.setOutput('request-id', result.Id.toString())
-
-    // Set a fallback so downstream steps always see a status output
-    core.setOutput('status', 'Unknown')
 
     // Poll until completion
     const finalStatus = await client.pollUntilComplete(

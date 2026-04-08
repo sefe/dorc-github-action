@@ -47,7 +47,7 @@ function isValidRequestStatus(value: unknown): value is RequestStatus {
     typeof value === 'object' &&
     value !== null &&
     'Id' in value &&
-    Number.isFinite((value as Record<string, unknown>).Id) &&
+    Number.isInteger((value as Record<string, unknown>).Id) &&
     'Status' in value &&
     typeof (value as Record<string, unknown>).Status === 'string'
   )

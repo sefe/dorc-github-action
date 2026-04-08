@@ -171,6 +171,22 @@ describe('resolveTokenUrl', () => {
     const url = await resolveTokenUrl('https://dorc.example.com')
     expect(url).toBe('https://ids.example.com/connect/token')
   })
+
+  it('retries on HTTP 503 from ApiConfig', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      statusText: 'Service Unavailable'
+    })
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ OAuthAuthority: 'https://ids.example.com' })
+    })
+
+    const url = await resolveTokenUrl('https://dorc.example.com')
+    expect(url).toBe('https://ids.example.com/connect/token')
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('fetchAccessToken', () => {

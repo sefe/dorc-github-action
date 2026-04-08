@@ -145,6 +145,21 @@ describe('main', () => {
     expect(statusCalls[1][1]).toBe('Completed')
   })
 
+  it('sets status to Unknown even when resolveTokenUrl fails', async () => {
+    setupInputs()
+    // ApiConfig returns 500
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      statusText: 'Internal Server Error'
+    })
+
+    await run()
+
+    expect(mockedCore.setOutput).toHaveBeenCalledWith('status', 'Unknown')
+    expect(mockedCore.setFailed).toHaveBeenCalled()
+  })
+
   it('fails on a failed deployment', async () => {
     setupInputs()
     mockTokenEndpoint()
@@ -210,6 +225,26 @@ describe('main', () => {
 
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       'poll-interval must be a positive integer (minimum 5)'
+    )
+  })
+
+  it('rejects poll-interval with trailing garbage', async () => {
+    setupInputs({ 'poll-interval': '5sec' })
+
+    await run()
+
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      'poll-interval must be a positive integer (minimum 5)'
+    )
+  })
+
+  it('rejects timeout with trailing garbage', async () => {
+    setupInputs({ timeout: '60min' })
+
+    await run()
+
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      'timeout must be a positive integer (minimum 1)'
     )
   })
 
