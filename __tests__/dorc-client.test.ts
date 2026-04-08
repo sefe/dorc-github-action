@@ -3,7 +3,8 @@ import { DorcClient } from '../src/dorc-client'
 jest.mock('@actions/core', () => ({
   info: jest.fn(),
   debug: jest.fn(),
-  warning: jest.fn()
+  warning: jest.fn(),
+  setSecret: jest.fn()
 }))
 
 const originalFetch = global.fetch
@@ -111,6 +112,17 @@ describe('DorcClient', () => {
         'unexpected response'
       )
     })
+
+    it('rejects NaN Id in response', async () => {
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      mockApiResponse({ Id: NaN, Status: 'Pending' })
+
+      await expect(client.getRequestStatus(42)).rejects.toThrow(
+        'unexpected response'
+      )
+    })
   })
 
   describe('getResultStatuses', () => {
@@ -124,25 +136,44 @@ describe('DorcClient', () => {
         'expected array'
       )
     })
+
+    it('throws when array elements have wrong shape', async () => {
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      mockApiResponse([{ Id: 1, Name: 'wrong shape' }])
+
+      await expect(client.getResultStatuses(42)).rejects.toThrow(
+        'malformed component result'
+      )
+    })
+  })
+
+  describe('token masking', () => {
+    it('masks the access token with core.setSecret', async () => {
+      const core = jest.requireMock('@actions/core')
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      mockApiResponse({ Id: 1, Status: 'Pending' })
+
+      await client.getRequestStatus(1)
+
+      expect(core.setSecret).toHaveBeenCalledWith('test-token')
+    })
   })
 
   describe('retries on 401', () => {
     it('invalidates token and retries on 401', async () => {
       const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
 
-      // Initial token
       mockTokenResponse()
-      // First API call returns 401
       mockFetch.mockResolvedValueOnce({
         ok: false,
         status: 401,
-        statusText: 'Unauthorized',
-        json: async () => ({}),
-        text: async () => 'Unauthorized'
+        statusText: 'Unauthorized'
       })
-      // New token on retry
       mockTokenResponse()
-      // Retry succeeds
       mockApiResponse({ Id: 42, Status: 'Pending' })
 
       const result = await client.getRequestStatus(42)
@@ -152,22 +183,18 @@ describe('DorcClient', () => {
     it('handles 401 followed by 503 on retry', async () => {
       const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
 
-      // Initial token
       mockTokenResponse()
-      // First call: 401
       mockFetch.mockResolvedValueOnce({
         ok: false,
         status: 401,
         statusText: 'Unauthorized'
       })
-      // Retry with new token: 503
       mockTokenResponse()
       mockFetch.mockResolvedValueOnce({
         ok: false,
         status: 503,
         statusText: 'Service Unavailable'
       })
-      // Third attempt succeeds
       mockApiResponse({ Id: 42, Status: 'Pending' })
 
       const result = await client.getRequestStatus(42)
@@ -196,6 +223,34 @@ describe('DorcClient', () => {
 
       mockTokenResponse()
       mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'))
+      mockApiResponse({ Id: 42, Status: 'Pending' })
+
+      const result = await client.getRequestStatus(42)
+      expect(result.Id).toBe(42)
+    })
+
+    it('retries on timeout errors', async () => {
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      mockFetch.mockRejectedValueOnce(
+        Object.assign(new Error('signal timed out'), {
+          name: 'TimeoutError'
+        })
+      )
+      mockApiResponse({ Id: 42, Status: 'Pending' })
+
+      const result = await client.getRequestStatus(42)
+      expect(result.Id).toBe(42)
+    })
+
+    it('retries when token refresh fails with network error', async () => {
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      // First ensureToken: network error on token fetch
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'))
+      // Second ensureToken: succeeds
+      mockTokenResponse()
       mockApiResponse({ Id: 42, Status: 'Pending' })
 
       const result = await client.getRequestStatus(42)
@@ -269,7 +324,6 @@ describe('DorcClient', () => {
       const elapsed = Date.now() - start
 
       expect(status).toBe('Completed')
-      // Should complete in well under 60 seconds (no pre-sleep)
       expect(elapsed).toBeLessThan(5000)
     })
 
@@ -335,6 +389,25 @@ describe('DorcClient', () => {
       await client.logComponentResults(1)
 
       expect(core.info).toHaveBeenCalledWith('No component results returned.')
+    })
+
+    it('truncates very long component logs', async () => {
+      const core = jest.requireMock('@actions/core')
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      const longLog = 'x'.repeat(100_000)
+      mockTokenResponse()
+      mockApiResponse([
+        { ComponentName: 'Comp1', Status: 'Completed', Log: longLog }
+      ])
+
+      await client.logComponentResults(1)
+
+      const logCalls = (core.info as jest.Mock).mock.calls
+      const truncatedCall = logCalls.find(
+        (c: string[]) => typeof c[0] === 'string' && c[0].includes('[truncated')
+      )
+      expect(truncatedCall).toBeDefined()
     })
   })
 

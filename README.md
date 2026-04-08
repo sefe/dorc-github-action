@@ -31,7 +31,7 @@ This is the GitHub Actions equivalent of the [DOrc Azure DevOps Extension](https
 | `build-num` | No | `''` | Version of the build, or `"latest"` |
 | `pinned` | No | `false` | Use only pinned builds |
 | `build-uri` | No | `''` | Artifact location URI (e.g. drop folder or GitHub artifact URL) |
-| `poll-interval` | No | `5` | Seconds between status polls (minimum 1) |
+| `poll-interval` | No | `5` | Seconds between status polls (minimum 5) |
 | `timeout` | No | `60` | Maximum minutes to wait for deployment to complete |
 
 ## Outputs
@@ -105,6 +105,15 @@ The action includes:
 - **Transient error retry** — HTTP 502/503/504 and network errors are retried up to 3 times with exponential backoff.
 - **Deployment timeout** — Configurable via the `timeout` input (default: 60 minutes). Prevents runaway jobs.
 - **Request timeouts** — Individual HTTP requests time out after 30-60 seconds to prevent hanging on unresponsive servers.
+
+## OAuth Configuration
+
+The action authenticates using the OAuth 2.0 client credentials flow with these hardcoded values:
+
+- **Client ID:** `dorc-cli`
+- **Scope:** `dorc-api.manage`
+
+These match the standard DOrc Identity Server configuration. If your DOrc instance uses different values, you will need to fork this action and update `src/auth.ts`.
 
 ## Development
 

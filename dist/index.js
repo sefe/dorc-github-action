@@ -31226,9 +31226,19 @@ module.exports = {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.fetchAccessToken = fetchAccessToken;
 exports.isTokenExpired = isTokenExpired;
+exports.validateHttpUrl = validateHttpUrl;
 exports.resolveTokenUrl = resolveTokenUrl;
 const REFRESH_WINDOW_SECONDS = 120;
 const FETCH_TIMEOUT_MS = 30_000;
+const RESOLVE_MAX_RETRIES = 2;
+const RESOLVE_RETRY_DELAY_MS = 2000;
+function isRetryableNetworkError(error) {
+    if (error instanceof Error && error.name === 'TimeoutError')
+        return true;
+    if (error instanceof TypeError)
+        return true;
+    return false;
+}
 async function fetchAccessToken(config) {
     const body = new URLSearchParams({
         grant_type: 'client_credentials',
@@ -31253,7 +31263,7 @@ async function fetchAccessToken(config) {
         throw new Error('Invalid token response: missing or invalid access_token field');
     }
     const tokenData = data;
-    const expiresIn = tokenData.expires_in ?? 3600;
+    const expiresIn = typeof tokenData.expires_in === 'number' ? tokenData.expires_in : 3600;
     const safeExpiry = Math.max(expiresIn - REFRESH_WINDOW_SECONDS, 30);
     return {
         accessToken: tokenData.access_token,
@@ -31263,30 +31273,52 @@ async function fetchAccessToken(config) {
 function isTokenExpired(state) {
     return new Date() >= state.expiresAt;
 }
-async function resolveTokenUrl(baseUrl) {
-    const url = `${baseUrl.replace(/\/+$/, '')}/ApiConfig`;
-    const response = await fetch(url, {
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-    });
-    if (!response.ok) {
-        throw new Error(`Failed to get API config: ${response.status} ${response.statusText}`);
-    }
-    const config = await response.json();
-    if (typeof config !== 'object' ||
-        config === null ||
-        !('OAuthAuthority' in config) ||
-        typeof config.OAuthAuthority !== 'string' ||
-        !config.OAuthAuthority) {
-        throw new Error('DOrc API config response missing or empty OAuthAuthority field');
-    }
-    const authority = config.OAuthAuthority.replace(/\/+$/, '');
+function validateHttpUrl(url, label) {
+    let parsed;
     try {
-        new URL(authority);
+        parsed = new URL(url);
     }
     catch {
-        throw new Error(`OAuthAuthority is not a valid URL: ${authority}`);
+        throw new Error(`${label} is not a valid URL: ${url}`);
     }
-    return `${authority}/connect/token`;
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        throw new Error(`${label} must use http or https (got ${parsed.protocol}): ${url}`);
+    }
+}
+async function resolveTokenUrl(baseUrl) {
+    const url = `${baseUrl.replace(/\/+$/, '')}/ApiConfig`;
+    let lastError;
+    for (let attempt = 0; attempt <= RESOLVE_MAX_RETRIES; attempt++) {
+        try {
+            const response = await fetch(url, {
+                signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+            });
+            if (!response.ok) {
+                throw new Error(`Failed to get API config: ${response.status} ${response.statusText}`);
+            }
+            const config = await response.json();
+            if (typeof config !== 'object' ||
+                config === null ||
+                !('OAuthAuthority' in config) ||
+                typeof config.OAuthAuthority !==
+                    'string' ||
+                !config.OAuthAuthority) {
+                throw new Error('DOrc API config response missing or empty OAuthAuthority field');
+            }
+            const authority = config.OAuthAuthority.replace(/\/+$/, '');
+            validateHttpUrl(authority, 'OAuthAuthority');
+            return `${authority}/connect/token`;
+        }
+        catch (error) {
+            lastError = error;
+            if (attempt < RESOLVE_MAX_RETRIES && isRetryableNetworkError(error)) {
+                await new Promise(resolve => setTimeout(resolve, RESOLVE_RETRY_DELAY_MS));
+                continue;
+            }
+            throw error;
+        }
+    }
+    throw lastError;
 }
 
 
@@ -31338,9 +31370,10 @@ const GOOD_STATUSES = ['Completed'];
 const BAD_STATUSES = ['Errored', 'Cancelled', 'Failed'];
 const TERMINAL_STATUSES = [...GOOD_STATUSES, ...BAD_STATUSES];
 const FETCH_TIMEOUT_MS = 60_000;
-const RETRYABLE_STATUS_CODES = [401, 502, 503, 504];
+const RETRYABLE_STATUS_CODES = [502, 503, 504];
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
+const MAX_COMPONENT_LOG_LENGTH = 50_000;
 function isRetryableError(error) {
     if (error instanceof Error && error.name === 'TimeoutError')
         return true;
@@ -31355,9 +31388,16 @@ function isValidRequestStatus(value) {
     return (typeof value === 'object' &&
         value !== null &&
         'Id' in value &&
-        typeof value.Id === 'number' &&
+        Number.isFinite(value.Id) &&
         'Status' in value &&
         typeof value.Status === 'string');
+}
+function isValidComponentResult(value) {
+    return (typeof value === 'object' &&
+        value !== null &&
+        typeof value.ComponentName === 'string' &&
+        typeof value.Status === 'string' &&
+        typeof value.Log === 'string');
 }
 class DorcClient {
     baseUrl;
@@ -31371,13 +31411,27 @@ class DorcClient {
         if (!this.tokenState || (0, auth_1.isTokenExpired)(this.tokenState)) {
             core.info('Refreshing DOrc access token...');
             this.tokenState = await (0, auth_1.fetchAccessToken)(this.tokenConfig);
+            core.setSecret(this.tokenState.accessToken);
         }
         return this.tokenState.accessToken;
     }
     async request(method, path, body) {
         const url = `${this.baseUrl}${path}`;
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            const token = await this.ensureToken();
+            let token;
+            try {
+                token = await this.ensureToken();
+            }
+            catch (error) {
+                if (attempt < MAX_RETRIES && isRetryableError(error)) {
+                    const delay = retryDelay(attempt);
+                    core.warning(`Token refresh failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${error}. Retrying in ${Math.round(delay)}ms...`);
+                    this.tokenState = null;
+                    await sleep(delay);
+                    continue;
+                }
+                throw error;
+            }
             const options = {
                 method,
                 headers: {
@@ -31425,7 +31479,8 @@ class DorcClient {
                         errorText = errorText.substring(0, 500) + '...';
                     }
                 }
-                catch {
+                catch (textError) {
+                    core.debug(`Failed to read response body: ${textError}`);
                     errorText = 'Could not read response body';
                 }
                 throw new Error(`DOrc API ${method} ${path} failed: ${response.status} ${response.statusText} - ${errorText}`);
@@ -31439,6 +31494,8 @@ class DorcClient {
             }
             return json;
         }
+        // Unreachable in practice: on the final attempt all branches either
+        // return or throw. Kept as a TypeScript exhaustiveness safeguard.
         throw new Error(`DOrc API ${method} ${path} failed after ${MAX_RETRIES + 1} attempts`);
     }
     async createRequest(req) {
@@ -31459,7 +31516,12 @@ class DorcClient {
     async getResultStatuses(requestId) {
         const result = await this.request('GET', `/ResultStatuses?requestId=${requestId}`);
         if (!Array.isArray(result)) {
-            throw new Error(`DOrc API returned unexpected response for GET /ResultStatuses: expected array`);
+            throw new Error('DOrc API returned unexpected response for GET /ResultStatuses: expected array');
+        }
+        for (const item of result) {
+            if (!isValidComponentResult(item)) {
+                throw new Error('DOrc API returned malformed component result: missing ComponentName, Status, or Log');
+            }
         }
         return result;
     }
@@ -31495,7 +31557,11 @@ class DorcClient {
             core.info('='.repeat(75));
             core.info(`  ${cmp.ComponentName} — ${cmp.Status}`);
             core.info('='.repeat(75));
-            core.info(cmp.Log);
+            const log = cmp.Log.length > MAX_COMPONENT_LOG_LENGTH
+                ? cmp.Log.substring(0, MAX_COMPONENT_LOG_LENGTH) +
+                    `\n... [truncated ${cmp.Log.length - MAX_COMPONENT_LOG_LENGTH} chars]`
+                : cmp.Log;
+            core.info(log);
         }
     }
     static isSuccessStatus(status) {
@@ -31607,10 +31673,10 @@ async function run() {
         const clientSecret = core.getInput('dorc-ids-secret', { required: true });
         core.setSecret(clientSecret);
         try {
-            new URL(baseUrl);
+            (0, auth_1.validateHttpUrl)(baseUrl, 'base-url');
         }
-        catch {
-            core.setFailed(`base-url is not a valid URL: ${baseUrl}`);
+        catch (e) {
+            core.setFailed(e instanceof Error ? e.message : String(e));
             return;
         }
         const project = core.getInput('project', { required: true });
@@ -31662,6 +31728,8 @@ async function run() {
         }
         core.info(`Request ${result.Id} created`);
         core.setOutput('request-id', result.Id.toString());
+        // Set a fallback so downstream steps always see a status output
+        core.setOutput('status', 'Unknown');
         // Poll until completion
         const finalStatus = await client.pollUntilComplete(result.Id, pollInterval, timeout);
         core.setOutput('status', finalStatus);

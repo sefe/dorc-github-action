@@ -107,12 +107,42 @@ describe('main', () => {
 
     await run()
 
-    // Check the POST body sent to /Request
-    const postCall = mockFetch.mock.calls[2]
-    const body = JSON.parse(postCall[1].body)
+    // Find the POST to /Request (not the token endpoint POST)
+    const requestCalls = mockFetch.mock.calls.filter(
+      (call: unknown[]) =>
+        typeof call[0] === 'string' && call[0].includes('/Request')
+    )
+    expect(requestCalls.length).toBeGreaterThanOrEqual(1)
+    const body = JSON.parse((requestCalls[0][1] as Record<string, string>).body)
     expect(body.BuildText).toBeNull()
     expect(body.BuildNum).toBeNull()
     expect(body.BuildUrl).toBeNull()
+  })
+
+  it('sets status output to Unknown before polling', async () => {
+    setupInputs()
+    mockTokenEndpoint()
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ Id: 100, Status: 'Pending' })
+    })
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ Id: 100, Status: 'Completed' })
+    })
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => []
+    })
+
+    await run()
+
+    const statusCalls = mockedCore.setOutput.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'status'
+    )
+    expect(statusCalls[0][1]).toBe('Unknown')
+    expect(statusCalls[1][1]).toBe('Completed')
   })
 
   it('fails on a failed deployment', async () => {
@@ -140,6 +170,16 @@ describe('main', () => {
 
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       'Deployment finished with status: Errored'
+    )
+  })
+
+  it('fails with non-http base-url', async () => {
+    setupInputs({ 'base-url': 'ftp://example.com' })
+
+    await run()
+
+    expect(mockedCore.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining('must use http or https')
     )
   })
 
@@ -223,7 +263,6 @@ describe('main', () => {
       json: async () => ({ Id: 300, Status: 'Failed' })
     })
 
-    // logComponentResults fails
     mockFetch.mockRejectedValueOnce(new Error('Network error'))
 
     await run()

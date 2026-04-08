@@ -1,5 +1,5 @@
 import * as core from '@actions/core'
-import { resolveTokenUrl } from './auth'
+import { resolveTokenUrl, validateHttpUrl } from './auth'
 import { DorcClient, DeployRequest } from './dorc-client'
 
 export async function run(): Promise<void> {
@@ -11,9 +11,9 @@ export async function run(): Promise<void> {
     core.setSecret(clientSecret)
 
     try {
-      new URL(baseUrl)
-    } catch {
-      core.setFailed(`base-url is not a valid URL: ${baseUrl}`)
+      validateHttpUrl(baseUrl, 'base-url')
+    } catch (e) {
+      core.setFailed(e instanceof Error ? e.message : String(e))
       return
     }
 
@@ -78,6 +78,9 @@ export async function run(): Promise<void> {
 
     core.info(`Request ${result.Id} created`)
     core.setOutput('request-id', result.Id.toString())
+
+    // Set a fallback so downstream steps always see a status output
+    core.setOutput('status', 'Unknown')
 
     // Poll until completion
     const finalStatus = await client.pollUntilComplete(

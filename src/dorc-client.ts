@@ -27,9 +27,10 @@ const GOOD_STATUSES = ['Completed']
 const BAD_STATUSES = ['Errored', 'Cancelled', 'Failed']
 const TERMINAL_STATUSES = [...GOOD_STATUSES, ...BAD_STATUSES]
 const FETCH_TIMEOUT_MS = 60_000
-const RETRYABLE_STATUS_CODES = [401, 502, 503, 504]
+const RETRYABLE_STATUS_CODES = [502, 503, 504]
 const MAX_RETRIES = 3
 const RETRY_BASE_DELAY_MS = 1000
+const MAX_COMPONENT_LOG_LENGTH = 50_000
 
 function isRetryableError(error: unknown): boolean {
   if (error instanceof Error && error.name === 'TimeoutError') return true
@@ -46,9 +47,19 @@ function isValidRequestStatus(value: unknown): value is RequestStatus {
     typeof value === 'object' &&
     value !== null &&
     'Id' in value &&
-    typeof (value as Record<string, unknown>).Id === 'number' &&
+    Number.isFinite((value as Record<string, unknown>).Id) &&
     'Status' in value &&
     typeof (value as Record<string, unknown>).Status === 'string'
+  )
+}
+
+function isValidComponentResult(value: unknown): value is ComponentResult {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as Record<string, unknown>).ComponentName === 'string' &&
+    typeof (value as Record<string, unknown>).Status === 'string' &&
+    typeof (value as Record<string, unknown>).Log === 'string'
   )
 }
 
@@ -64,6 +75,7 @@ export class DorcClient {
     if (!this.tokenState || isTokenExpired(this.tokenState)) {
       core.info('Refreshing DOrc access token...')
       this.tokenState = await fetchAccessToken(this.tokenConfig)
+      core.setSecret(this.tokenState.accessToken)
     }
     return this.tokenState.accessToken
   }
@@ -76,7 +88,22 @@ export class DorcClient {
     const url = `${this.baseUrl}${path}`
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      const token = await this.ensureToken()
+      let token: string
+      try {
+        token = await this.ensureToken()
+      } catch (error) {
+        if (attempt < MAX_RETRIES && isRetryableError(error)) {
+          const delay = retryDelay(attempt)
+          core.warning(
+            `Token refresh failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${error}. Retrying in ${Math.round(delay)}ms...`
+          )
+          this.tokenState = null
+          await sleep(delay)
+          continue
+        }
+        throw error
+      }
+
       const options: RequestInit = {
         method,
         headers: {
@@ -134,7 +161,8 @@ export class DorcClient {
           if (errorText.length > 500) {
             errorText = errorText.substring(0, 500) + '...'
           }
-        } catch {
+        } catch (textError) {
+          core.debug(`Failed to read response body: ${textError}`)
           errorText = 'Could not read response body'
         }
         throw new Error(
@@ -151,6 +179,8 @@ export class DorcClient {
       return json as T
     }
 
+    // Unreachable in practice: on the final attempt all branches either
+    // return or throw. Kept as a TypeScript exhaustiveness safeguard.
     throw new Error(
       `DOrc API ${method} ${path} failed after ${MAX_RETRIES + 1} attempts`
     )
@@ -187,10 +217,17 @@ export class DorcClient {
     )
     if (!Array.isArray(result)) {
       throw new Error(
-        `DOrc API returned unexpected response for GET /ResultStatuses: expected array`
+        'DOrc API returned unexpected response for GET /ResultStatuses: expected array'
       )
     }
-    return result as ComponentResult[]
+    for (const item of result) {
+      if (!isValidComponentResult(item)) {
+        throw new Error(
+          'DOrc API returned malformed component result: missing ComponentName, Status, or Log'
+        )
+      }
+    }
+    return result
   }
 
   async pollUntilComplete(
@@ -237,7 +274,12 @@ export class DorcClient {
       core.info('='.repeat(75))
       core.info(`  ${cmp.ComponentName} — ${cmp.Status}`)
       core.info('='.repeat(75))
-      core.info(cmp.Log)
+      const log =
+        cmp.Log.length > MAX_COMPONENT_LOG_LENGTH
+          ? cmp.Log.substring(0, MAX_COMPONENT_LOG_LENGTH) +
+            `\n... [truncated ${cmp.Log.length - MAX_COMPONENT_LOG_LENGTH} chars]`
+          : cmp.Log
+      core.info(log)
     }
   }
 
