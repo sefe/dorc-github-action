@@ -313,11 +313,28 @@ describe('DorcClient', () => {
   })
 
   describe('pollUntilComplete', () => {
+    // Each poll iteration now also calls getResultStatuses for live progress.
+    // We mock both the status response and the component results response.
+    function mockPollIteration(
+      requestStatus: string,
+      components: object[] = []
+    ): void {
+      mockApiResponse({ Id: 1, Status: requestStatus })
+      mockApiResponse(
+        components.map(c => ({
+          ComponentName: 'C',
+          Status: 'S',
+          Log: '',
+          ...c
+        }))
+      )
+    }
+
     it('checks status immediately without sleeping first', async () => {
       const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
 
       mockTokenResponse()
-      mockApiResponse({ Id: 1, Status: 'Completed' })
+      mockPollIteration('Completed')
 
       const start = Date.now()
       const status = await client.pollUntilComplete(1, 60, 1)
@@ -331,18 +348,40 @@ describe('DorcClient', () => {
       const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
 
       mockTokenResponse()
-      mockApiResponse({ Id: 1, Status: 'InProgress' })
-      mockApiResponse({ Id: 1, Status: 'Completed' })
+      mockPollIteration('InProgress', [
+        { ComponentName: 'Comp1', Status: 'Deploying' }
+      ])
+      mockPollIteration('Completed', [
+        { ComponentName: 'Comp1', Status: 'Completed' }
+      ])
 
       const status = await client.pollUntilComplete(1, 0.01, 1)
       expect(status).toBe('Completed')
+    })
+
+    it('logs live component status changes', async () => {
+      const core = jest.requireMock('@actions/core')
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      mockPollIteration('InProgress', [
+        { ComponentName: 'Web', Status: 'Deploying' }
+      ])
+      mockPollIteration('Completed', [
+        { ComponentName: 'Web', Status: 'Completed' }
+      ])
+
+      await client.pollUntilComplete(1, 0.01, 1)
+
+      expect(core.info).toHaveBeenCalledWith("  Component 'Web': Deploying")
+      expect(core.info).toHaveBeenCalledWith("  Component 'Web': Completed")
     })
 
     it('returns on failure statuses', async () => {
       const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
 
       mockTokenResponse()
-      mockApiResponse({ Id: 1, Status: 'Errored' })
+      mockPollIteration('Errored')
 
       const status = await client.pollUntilComplete(1, 0.01, 1)
       expect(status).toBe('Errored')
@@ -353,7 +392,7 @@ describe('DorcClient', () => {
 
       mockTokenResponse()
       for (let i = 0; i < 20; i++) {
-        mockApiResponse({ Id: 1, Status: 'InProgress' })
+        mockPollIteration('InProgress')
       }
 
       await expect(client.pollUntilComplete(1, 0.01, 0.001)).rejects.toThrow(
@@ -363,20 +402,62 @@ describe('DorcClient', () => {
   })
 
   describe('logComponentResults', () => {
-    it('logs component results', async () => {
+    it('fetches full logs via /ResultStatuses/Log endpoint', async () => {
+      const core = jest.requireMock('@actions/core')
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      // getResultStatuses
+      mockApiResponse([
+        { Id: 10, ComponentName: 'Comp1', Status: 'Completed', Log: 'preview' }
+      ])
+      // getComponentLog for Comp1
+      mockApiResponse('Full deployment log for Comp1')
+
+      await client.logComponentResults(1)
+
+      expect(core.info).toHaveBeenCalledWith(expect.stringContaining('Comp1'))
+      expect(core.info).toHaveBeenCalledWith('Full deployment log for Comp1')
+    })
+
+    it('falls back to preview log when full log returns 404', async () => {
       const core = jest.requireMock('@actions/core')
       const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
 
       mockTokenResponse()
       mockApiResponse([
-        { ComponentName: 'Comp1', Status: 'Completed', Log: 'Done' },
-        { ComponentName: 'Comp2', Status: 'Errored', Log: 'Failed' }
+        {
+          Id: 10,
+          ComponentName: 'Comp1',
+          Status: 'Completed',
+          Log: 'preview log'
+        }
+      ])
+      // getComponentLog returns 404
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        text: async () => 'Not Found'
+      })
+
+      await client.logComponentResults(1)
+
+      expect(core.info).toHaveBeenCalledWith('preview log')
+    })
+
+    it('uses preview log when component has no Id', async () => {
+      const core = jest.requireMock('@actions/core')
+      const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
+
+      mockTokenResponse()
+      mockApiResponse([
+        { ComponentName: 'Comp1', Status: 'Completed', Log: 'preview only' }
       ])
 
       await client.logComponentResults(1)
 
-      expect(core.info).toHaveBeenCalledWith(expect.stringContaining('Comp1'))
-      expect(core.info).toHaveBeenCalledWith(expect.stringContaining('Comp2'))
+      expect(core.info).toHaveBeenCalledWith('preview only')
     })
 
     it('logs a message when no results returned', async () => {
@@ -391,15 +472,16 @@ describe('DorcClient', () => {
       expect(core.info).toHaveBeenCalledWith('No component results returned.')
     })
 
-    it('truncates very long component logs', async () => {
+    it('truncates very long full logs', async () => {
       const core = jest.requireMock('@actions/core')
       const client = new DorcClient('https://dorc.example.com', TOKEN_CONFIG)
 
-      const longLog = 'x'.repeat(100_000)
       mockTokenResponse()
       mockApiResponse([
-        { ComponentName: 'Comp1', Status: 'Completed', Log: longLog }
+        { Id: 10, ComponentName: 'Comp1', Status: 'Completed', Log: 'short' }
       ])
+      // Full log is very long
+      mockApiResponse('x'.repeat(100_000))
 
       await client.logComponentResults(1)
 

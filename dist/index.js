@@ -31536,10 +31536,25 @@ class DorcClient {
         }
         return result;
     }
+    async getComponentLog(requestId, resultId) {
+        try {
+            const result = await this.request('GET', `/ResultStatuses/Log?requestId=${requestId}&resultId=${resultId}`);
+            return typeof result === 'string' ? result : JSON.stringify(result);
+        }
+        catch (error) {
+            // 404 means no full log available — fall back to preview
+            if (error instanceof Error && error.message.includes('404')) {
+                return null;
+            }
+            core.warning(`Failed to fetch full log for resultId ${resultId}: ${error instanceof Error ? error.message : error}`);
+            return null;
+        }
+    }
     async pollUntilComplete(requestId, pollIntervalSeconds, timeoutMinutes) {
         let lastStatus = '';
         const deadline = Date.now() + timeoutMinutes * 60 * 1000;
         const jitterMs = 1000;
+        const componentStatuses = new Map();
         // Check immediately, then sleep between subsequent polls
         let firstPoll = true;
         while (Date.now() < deadline) {
@@ -31551,6 +31566,20 @@ class DorcClient {
             if (status.Status !== lastStatus) {
                 core.info(`Request ${requestId} status changed to: ${status.Status}`);
                 lastStatus = status.Status;
+            }
+            // Live component progress — fetch and log status changes
+            try {
+                const components = await this.getResultStatuses(requestId);
+                for (const cmp of components) {
+                    const prev = componentStatuses.get(cmp.ComponentName);
+                    if (prev !== cmp.Status) {
+                        core.info(`  Component '${cmp.ComponentName}': ${cmp.Status}`);
+                        componentStatuses.set(cmp.ComponentName, cmp.Status);
+                    }
+                }
+            }
+            catch {
+                // Non-fatal — live progress is best-effort
             }
             if (TERMINAL_STATUSES.includes(lastStatus)) {
                 return lastStatus;
@@ -31568,10 +31597,22 @@ class DorcClient {
             core.info('='.repeat(75));
             core.info(`  ${cmp.ComponentName} — ${cmp.Status}`);
             core.info('='.repeat(75));
-            const log = cmp.Log.length > MAX_COMPONENT_LOG_LENGTH
-                ? cmp.Log.substring(0, MAX_COMPONENT_LOG_LENGTH) +
-                    `\n... [truncated ${cmp.Log.length - MAX_COMPONENT_LOG_LENGTH} chars]`
-                : cmp.Log;
+            // Fetch full log from dedicated endpoint, fall back to preview
+            let log = cmp.Log;
+            if (cmp.Id != null) {
+                const fullLog = await this.getComponentLog(requestId, cmp.Id);
+                if (fullLog !== null) {
+                    log = fullLog;
+                }
+                else {
+                    core.debug(`No full log for '${cmp.ComponentName}', using preview.`);
+                }
+            }
+            if (log.length > MAX_COMPONENT_LOG_LENGTH) {
+                log =
+                    log.substring(0, MAX_COMPONENT_LOG_LENGTH) +
+                        `\n... [truncated ${log.length - MAX_COMPONENT_LOG_LENGTH} chars]`;
+            }
             core.info(log);
         }
     }
