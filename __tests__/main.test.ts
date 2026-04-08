@@ -59,26 +59,77 @@ describe('main', () => {
     })
   }
 
+  // Helper: mock one poll iteration (getRequestStatus + getResultStatuses for live progress)
+  function mockPollIteration(status: string, components: object[] = []): void {
+    // getRequestStatus
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ Id: 1, Status: status })
+    })
+    // getResultStatuses (live progress)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () =>
+        components.map(c => ({
+          ComponentName: 'C',
+          Status: 'S',
+          Log: '',
+          ...c
+        }))
+    })
+  }
+
+  // Helper: mock logComponentResults (getResultStatuses + getComponentLog per component)
+  function mockLogRetrieval(
+    components: Array<{
+      Id?: number
+      ComponentName: string
+      Status: string
+      Log: string
+      fullLog?: string
+    }>
+  ): void {
+    // getResultStatuses
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => components
+    })
+    // getComponentLog for each component that has an Id
+    for (const cmp of components) {
+      if (cmp.Id != null) {
+        mockFetch.mockResolvedValueOnce({
+          ok: true,
+          json: async () => cmp.fullLog ?? cmp.Log
+        })
+      }
+    }
+  }
+
   it('runs a successful deployment end-to-end', async () => {
     setupInputs()
     mockTokenEndpoint()
 
+    // POST /Request
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ Id: 100, Status: 'Pending' })
     })
 
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ Id: 100, Status: 'Completed' })
-    })
+    // Poll: getRequestStatus + getResultStatuses (live progress)
+    mockPollIteration('Completed', [
+      { ComponentName: 'Comp1', Status: 'Completed' }
+    ])
 
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => [
-        { ComponentName: 'Comp1', Status: 'Completed', Log: 'OK' }
-      ]
-    })
+    // logComponentResults: getResultStatuses + getComponentLog
+    mockLogRetrieval([
+      {
+        Id: 10,
+        ComponentName: 'Comp1',
+        Status: 'Completed',
+        Log: 'preview',
+        fullLog: 'Full log output'
+      }
+    ])
 
     await run()
 
@@ -86,6 +137,10 @@ describe('main', () => {
     expect(mockedCore.setOutput).toHaveBeenCalledWith('request-id', '100')
     expect(mockedCore.setOutput).toHaveBeenCalledWith('status', 'Completed')
     expect(mockedCore.setFailed).not.toHaveBeenCalled()
+    // Verify logComponentResults actually ran (not silently swallowed)
+    expect(mockedCore.warning).not.toHaveBeenCalledWith(
+      expect.stringContaining('Failed to fetch component results')
+    )
   })
 
   it('sends null for empty optional fields', async () => {
@@ -96,18 +151,11 @@ describe('main', () => {
       ok: true,
       json: async () => ({ Id: 100, Status: 'Pending' })
     })
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ Id: 100, Status: 'Completed' })
-    })
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => []
-    })
+    mockPollIteration('Completed')
+    mockLogRetrieval([])
 
     await run()
 
-    // Find the POST to /Request (not the token endpoint POST)
     const requestCalls = mockFetch.mock.calls.filter(
       (call: unknown[]) =>
         typeof call[0] === 'string' && call[0].includes('/Request')
@@ -127,14 +175,8 @@ describe('main', () => {
       ok: true,
       json: async () => ({ Id: 100, Status: 'Pending' })
     })
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ Id: 100, Status: 'Completed' })
-    })
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => []
-    })
+    mockPollIteration('Completed')
+    mockLogRetrieval([])
 
     await run()
 
@@ -147,7 +189,6 @@ describe('main', () => {
 
   it('sets status to Unknown even when resolveTokenUrl fails', async () => {
     setupInputs()
-    // ApiConfig returns 500
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 500,
@@ -168,18 +209,17 @@ describe('main', () => {
       ok: true,
       json: async () => ({ Id: 200, Status: 'Pending' })
     })
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ Id: 200, Status: 'Errored' })
-    })
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => [
-        { ComponentName: 'Comp1', Status: 'Errored', Log: 'Something broke' }
-      ]
-    })
+    mockPollIteration('Errored', [
+      { ComponentName: 'Comp1', Status: 'Errored' }
+    ])
+    mockLogRetrieval([
+      {
+        Id: 10,
+        ComponentName: 'Comp1',
+        Status: 'Errored',
+        Log: 'Something broke'
+      }
+    ])
 
     await run()
 
@@ -190,9 +230,7 @@ describe('main', () => {
 
   it('fails with non-http base-url', async () => {
     setupInputs({ 'base-url': 'ftp://example.com' })
-
     await run()
-
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       expect.stringContaining('must use http or https')
     )
@@ -200,9 +238,7 @@ describe('main', () => {
 
   it('fails with invalid base-url', async () => {
     setupInputs({ 'base-url': 'not-a-url' })
-
     await run()
-
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       expect.stringContaining('not a valid URL')
     )
@@ -210,9 +246,7 @@ describe('main', () => {
 
   it('fails with invalid poll-interval', async () => {
     setupInputs({ 'poll-interval': 'abc' })
-
     await run()
-
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       'poll-interval must be a positive integer (minimum 5)'
     )
@@ -220,9 +254,7 @@ describe('main', () => {
 
   it('fails with poll-interval below minimum', async () => {
     setupInputs({ 'poll-interval': '2' })
-
     await run()
-
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       'poll-interval must be a positive integer (minimum 5)'
     )
@@ -230,9 +262,7 @@ describe('main', () => {
 
   it('rejects poll-interval with trailing garbage', async () => {
     setupInputs({ 'poll-interval': '5sec' })
-
     await run()
-
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       'poll-interval must be a positive integer (minimum 5)'
     )
@@ -240,9 +270,7 @@ describe('main', () => {
 
   it('rejects timeout with trailing garbage', async () => {
     setupInputs({ timeout: '60min' })
-
     await run()
-
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       'timeout must be a positive integer (minimum 1)'
     )
@@ -250,9 +278,7 @@ describe('main', () => {
 
   it('fails with invalid timeout', async () => {
     setupInputs({ timeout: '-5' })
-
     await run()
-
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       'timeout must be a positive integer (minimum 1)'
     )
@@ -260,9 +286,7 @@ describe('main', () => {
 
   it('fails with empty components', async () => {
     setupInputs({ components: ';;;' })
-
     await run()
-
     expect(mockedCore.setFailed).toHaveBeenCalledWith(
       'components must contain at least one non-empty component name'
     )
@@ -292,12 +316,9 @@ describe('main', () => {
       ok: true,
       json: async () => ({ Id: 300, Status: 'Pending' })
     })
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ Id: 300, Status: 'Failed' })
-    })
-
+    // Poll iteration: status + live progress
+    mockPollIteration('Failed', [{ ComponentName: 'Comp1', Status: 'Failed' }])
+    // logComponentResults fails on getResultStatuses
     mockFetch.mockRejectedValueOnce(new Error('Network error'))
 
     await run()

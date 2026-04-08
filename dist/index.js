@@ -31374,7 +31374,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.DorcClient = void 0;
+exports.DorcClient = exports.DorcApiError = void 0;
 const core = __importStar(__nccwpck_require__(7484));
 const auth_1 = __nccwpck_require__(9081);
 const GOOD_STATUSES = ['Completed'];
@@ -31385,6 +31385,15 @@ const RETRYABLE_STATUS_CODES = [502, 503, 504];
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 const MAX_COMPONENT_LOG_LENGTH = 50_000;
+class DorcApiError extends Error {
+    statusCode;
+    constructor(statusCode, message) {
+        super(message);
+        this.statusCode = statusCode;
+        this.name = 'DorcApiError';
+    }
+}
+exports.DorcApiError = DorcApiError;
 function isRetryableError(error) {
     if (error instanceof Error && error.name === 'TimeoutError')
         return true;
@@ -31494,7 +31503,7 @@ class DorcClient {
                     core.debug(`Failed to read response body: ${textError}`);
                     errorText = 'Could not read response body';
                 }
-                throw new Error(`DOrc API ${method} ${path} failed: ${response.status} ${response.statusText} - ${errorText}`);
+                throw new DorcApiError(response.status, `DOrc API ${method} ${path} failed: ${response.status} ${response.statusText} - ${errorText}`);
             }
             let json;
             try {
@@ -31543,7 +31552,7 @@ class DorcClient {
         }
         catch (error) {
             // 404 means no full log available — fall back to preview
-            if (error instanceof Error && error.message.includes('404')) {
+            if (error instanceof DorcApiError && error.statusCode === 404) {
                 return null;
             }
             core.warning(`Failed to fetch full log for resultId ${resultId}: ${error instanceof Error ? error.message : error}`);
@@ -31578,8 +31587,8 @@ class DorcClient {
                     }
                 }
             }
-            catch {
-                // Non-fatal — live progress is best-effort
+            catch (progressError) {
+                core.debug(`Live progress fetch failed (non-fatal): ${progressError instanceof Error ? progressError.message : progressError}`);
             }
             if (TERMINAL_STATUSES.includes(lastStatus)) {
                 return lastStatus;

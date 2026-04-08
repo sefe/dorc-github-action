@@ -97,6 +97,21 @@ To deploy from a GitHub artifact location, use the `build-uri` input:
     build-uri: ${{ steps.upload.outputs.artifact-url }}
 ```
 
+## Live Logging
+
+During deployment, the action provides real-time progress updates by polling component statuses on each interval:
+
+```
+Request 42 status changed to: InProgress
+  Component 'WebApp': Deploying
+  Component 'Database': Deploying
+  Component 'Database': Completed
+  Component 'WebApp': Completed
+Request 42 status changed to: Completed
+```
+
+After completion, full deployment logs are fetched for each component via the `/ResultStatuses/Log` endpoint. If a full log is not available (404), the preview log from the status response is used instead.
+
 ## Error Handling
 
 The action includes:
